@@ -1489,6 +1489,9 @@ dependencies = [
 [[package]]
 name = "s3d-math"
 version = "0.1.0"
+dependencies = [
+ "s3d-shared",
+]
 
 [[package]]
 name = "s3d-shared"
