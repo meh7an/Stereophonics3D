@@ -32,6 +32,7 @@ glsl vulkan1.0 glsl_tese glsl_tese.tese -O
 glsl vulkan1.0 glsl_geom glsl_geom.geom -O
 glsl vulkan1.3 glsl_mesh glsl_mesh.mesh -O
 glsl vulkan1.0 glsl_frag glsl_frag.frag -O
+glsl vulkan1.3 glsl_push glsl_push.vert -O
 hlsl vulkan1.0 hlsl_basic
 hlsl vulkan1.3 hlsl_struct
 "$bin/spirv-as" --target-env vulkan1.0 "$src/multi_entry.spvasm" -o "$here/multi_entry.spv"

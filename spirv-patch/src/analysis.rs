@@ -217,7 +217,9 @@ impl ShaderModule {
     }
 
     /// Every instruction inside a function body, with its index and the function's id.
-    fn function_instructions(&self) -> impl Iterator<Item = (usize, Word, &Instruction)> {
+    pub(crate) fn function_instructions(
+        &self,
+    ) -> impl Iterator<Item = (usize, Word, &Instruction)> {
         let mut current = None;
         self.instructions
             .iter()
@@ -233,7 +235,7 @@ impl ShaderModule {
     }
 
     /// Functions the entry function can reach through `OpFunctionCall`, itself included.
-    fn reachable_functions(&self, entry: Word) -> HashSet<Word> {
+    pub(crate) fn reachable_functions(&self, entry: Word) -> HashSet<Word> {
         let mut callees: HashMap<Word, Vec<Word>> = HashMap::new();
         for (_, function, instruction) in self.function_instructions() {
             if let (Some(Op::FunctionCall), [_ty, _result, callee, ..]) =

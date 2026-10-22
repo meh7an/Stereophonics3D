@@ -49,14 +49,55 @@ pub fn validate(words: &[u32], environment: &str) -> Result<()> {
     // diagnostic out-pointer is either left null or set to an object freed below.
     let result =
         unsafe { spvValidateBinary(context.0, words.as_ptr(), words.len(), &mut diagnostic) };
-    if result == SPV_SUCCESS {
-        // SAFETY: destroying a null diagnostic is a documented no-op.
-        unsafe { spvDiagnosticDestroy(diagnostic) };
-        return Ok(());
-    }
-    // SAFETY: on failure SPIRV-Tools either leaves the pointer null or points it at a
-    // diagnostic whose `error` is a NUL-terminated string; both are freed right after.
-    let (word, message) = unsafe {
+    // SAFETY: `diagnostic` is null or was produced by the call above.
+    unsafe { check(result, diagnostic) }
+}
+
+/// Disassembles `words` into indented text with friendly names, as `spirv-dis` prints it.
+///
+/// # Errors
+///
+/// Returns [`Error::Invalid`] when the words cannot be decoded.
+pub fn disassemble(words: &[u32]) -> Result<String> {
+    let context = Context::new(VULKAN_1_3)?;
+    let mut text: *mut Text = ptr::null_mut();
+    let mut diagnostic: *mut Diagnostic = ptr::null_mut();
+    // SAFETY: as in `validate`; `text` is an out-pointer to an object freed below.
+    let result = unsafe {
+        spvBinaryToText(
+            context.0,
+            words.as_ptr(),
+            words.len(),
+            BINARY_TO_TEXT_INDENT | BINARY_TO_TEXT_FRIENDLY_NAMES,
+            &mut text,
+            &mut diagnostic,
+        )
+    };
+    // SAFETY: on success `text` points at `length` bytes of UTF-8; it is freed once.
+    let disassembly = unsafe {
+        let content = text.as_ref().map(|t| {
+            let bytes = std::slice::from_raw_parts(t.str.cast::<u8>(), t.length);
+            String::from_utf8_lossy(bytes)
+                .trim_end_matches('\0')
+                .to_owned()
+        });
+        spvTextDestroy(text);
+        content
+    };
+    // SAFETY: `diagnostic` is null or was produced by the call above.
+    unsafe { check(result, diagnostic)? };
+    Ok(disassembly.unwrap_or_default())
+}
+
+/// Turns a SPIRV-Tools result and diagnostic into `Ok` or [`Error::Invalid`], freeing the
+/// diagnostic.
+///
+/// # Safety
+///
+/// `diagnostic` must be null or a diagnostic returned by SPIRV-Tools and not yet freed.
+unsafe fn check(result: c_int, diagnostic: *mut Diagnostic) -> Result<()> {
+    // SAFETY: guaranteed by the caller; `error` is a NUL-terminated string when set.
+    let details = unsafe {
         let details = diagnostic.as_ref().map(|d| {
             let message = if d.error.is_null() {
                 String::new()
@@ -66,8 +107,12 @@ pub fn validate(words: &[u32], environment: &str) -> Result<()> {
             (d.position.index, message)
         });
         spvDiagnosticDestroy(diagnostic);
-        details.unwrap_or((0, format!("validator returned code {result}")))
+        details
     };
+    if result == SPV_SUCCESS {
+        return Ok(());
+    }
+    let (word, message) = details.unwrap_or((0, format!("SPIRV-Tools returned code {result}")));
     Err(Error::Invalid { word, message })
 }
 
@@ -100,6 +145,17 @@ impl Drop for Context {
 }
 
 const SPV_SUCCESS: c_int = 0;
+/// `SPV_BINARY_TO_TEXT_OPTION_INDENT`, `SPV_BIT(3)`.
+const BINARY_TO_TEXT_INDENT: u32 = 1 << 3;
+/// `SPV_BINARY_TO_TEXT_OPTION_FRIENDLY_NAMES`, `SPV_BIT(6)`.
+const BINARY_TO_TEXT_FRIENDLY_NAMES: u32 = 1 << 6;
+
+/// `spv_text_t` from `libspirv.h`.
+#[repr(C)]
+struct Text {
+    str: *const c_char,
+    length: usize,
+}
 
 /// `spv_position_t` from `libspirv.h`.
 #[repr(C)]
@@ -129,6 +185,15 @@ unsafe extern "C" {
         diagnostic: *mut *mut Diagnostic,
     ) -> c_int;
     fn spvDiagnosticDestroy(diagnostic: *mut Diagnostic);
+    fn spvBinaryToText(
+        context: *const c_void,
+        binary: *const u32,
+        word_count: usize,
+        options: u32,
+        text: *mut *mut Text,
+        diagnostic: *mut *mut Diagnostic,
+    ) -> c_int;
+    fn spvTextDestroy(text: *mut Text);
 }
 
 #[cfg(test)]
@@ -198,5 +263,12 @@ mod tests {
             validate(&minimal(), "vulkan9.9"),
             Err(Error::UnknownEnvironment(_))
         ));
+    }
+
+    #[test]
+    fn test_disassemble_names_entry_point() {
+        let text = disassemble(&minimal()).expect("disassemble");
+        assert!(text.contains("OpEntryPoint Vertex"), "{text}");
+        assert!(text.contains("OpFunctionEnd"), "{text}");
     }
 }

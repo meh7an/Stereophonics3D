@@ -1,38 +1,11 @@
 //! Corpus tests over `fixtures/spirv`: every module round-trips word for word and
 //! validates, and the analysis finds each fixture's stage, `Position` form and stores.
 
-use std::{fs, path::PathBuf};
+mod common;
 
+use common::{FIXTURES, module, words};
 use s3d_shared::ShaderHash;
-use s3d_spirv_patch::{PositionForm, ShaderModule, Stage, StoreTarget, words_from_bytes};
-
-const FIXTURES: [&str; 11] = [
-    "glsl_basic",
-    "glsl_piecewise",
-    "glsl_redeclared",
-    "glsl_function",
-    "glsl_tese",
-    "glsl_geom",
-    "glsl_mesh",
-    "glsl_frag",
-    "hlsl_basic",
-    "hlsl_struct",
-    "multi_entry",
-];
-
-fn words(name: &str) -> Vec<u32> {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("fixtures")
-        .join("spirv")
-        .join(format!("{name}.spv"));
-    let bytes = fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-    words_from_bytes(&bytes).expect("whole words")
-}
-
-fn module(name: &str) -> ShaderModule {
-    ShaderModule::parse(&words(name)).unwrap_or_else(|e| panic!("{name}: {e}"))
-}
+use s3d_spirv_patch::{PositionForm, Stage, StoreTarget};
 
 #[test]
 fn test_every_fixture_validates_and_round_trips_word_for_word() {
@@ -114,6 +87,7 @@ fn test_analysis_matches_expectations() {
             ..expect("glsl_mesh", "main", Stage::Mesh, MEMBER_0, WHOLE)
         },
         expect("glsl_frag", "main", Stage::Fragment, None, &[]),
+        expect("glsl_push", "main", Stage::Vertex, MEMBER_0, WHOLE),
         expect("hlsl_basic", "main", Stage::Vertex, VARIABLE, WHOLE),
         expect("hlsl_struct", "main", Stage::Vertex, VARIABLE, WHOLE),
         expect("multi_entry", "a", Stage::Vertex, VARIABLE, WHOLE),
