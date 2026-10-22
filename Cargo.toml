@@ -1,0 +1,12 @@
+[workspace]
+resolver = "3"
+members = [
+    "install",
+    "layer",
+    "math",
+    "shared",
+    "spirv-patch",
+    "spirv-val",
+    "testscene",
+    "verify",
+]

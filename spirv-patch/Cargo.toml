@@ -1,0 +1,8 @@
+[package]
+name = "s3d-spirv-patch"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rspirv = "0.13.0"
+thiserror = "2.0.21"

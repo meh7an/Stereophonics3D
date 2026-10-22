@@ -1,0 +1,9 @@
+[package]
+name = "s3d-testscene"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+ash = "0.38.0"
+winit = "0.30.13"
