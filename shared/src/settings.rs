@@ -21,12 +21,16 @@ use crate::{
 const CONFIG_FILE: &str = "config.toml";
 const PROFILES_DIR: &str = "profiles";
 
-/// `%APPDATA%\Stereophonics3D`.
+/// `%APPDATA%\Stereophonics3D`, or the directory in `S3D_CONFIG_DIR` when set (tests and
+/// portable setups).
 ///
 /// # Errors
 ///
-/// Returns [`Error::NoAppData`] when `APPDATA` is unset.
+/// Returns [`Error::NoAppData`] when neither variable is set.
 pub fn default_config_dir() -> Result<PathBuf> {
+    if let Some(dir) = std::env::var_os(crate::layer::CONFIG_DIR_ENV) {
+        return Ok(PathBuf::from(dir));
+    }
     std::env::var_os("APPDATA")
         .map(|base| PathBuf::from(base).join("Stereophonics3D"))
         .ok_or(Error::NoAppData)

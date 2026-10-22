@@ -10,10 +10,11 @@ mod vulkan;
 
 use std::path::PathBuf;
 
-use anyhow::{Result, bail};
+use anyhow::{Context as _, Result, bail};
 use ash::vk;
 use clap::Parser;
 use s3d_shared::capture::Image;
+use windows::{Win32::System::LibraryLoader::LoadLibraryW, core::HSTRING};
 use winit::{
     application::ApplicationHandler,
     dpi::PhysicalSize,
@@ -56,12 +57,22 @@ struct Args {
     /// Read the frame counter back from the last frame's pixels and fail on a mismatch.
     #[arg(long)]
     self_check: bool,
+
+    /// Load these DLLs before Vulkan starts, e.g. a renamed harmless DLL to test the
+    /// layer's anti-cheat refusal; repeatable.
+    #[arg(long)]
+    preload: Vec<PathBuf>,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
     let _log_guard = s3d_shared::logging::init("s3d-testscene")?;
     tracing::info!(?args, "starting");
+    for path in &args.preload {
+        // SAFETY: loading a DLL the user named; it stays loaded for the whole run.
+        unsafe { LoadLibraryW(&HSTRING::from(path.as_os_str())) }
+            .with_context(|| format!("cannot load {}", path.display()))?;
+    }
 
     let event_loop = EventLoop::new()?;
     let mut app = App::new(args);

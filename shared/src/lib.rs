@@ -5,6 +5,7 @@ pub mod capture;
 pub mod config;
 pub mod error;
 pub mod ffi;
+pub mod layer;
 pub mod logging;
 pub mod settings;
 pub mod shader_hash;

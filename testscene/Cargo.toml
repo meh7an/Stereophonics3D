@@ -12,4 +12,5 @@ glam = "0.34.1"
 s3d-shared = { version = "0.1.0", path = "../shared" }
 s3d-verify = { version = "0.1.0", path = "../verify" }
 tracing = "0.1.44"
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_System_LibraryLoader"] }
 winit = "0.30.13"

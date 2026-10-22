@@ -3,8 +3,12 @@ name = "s3d-layer"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+crate-type = ["cdylib"]
+
 [dependencies]
 ash = "0.38.0"
+s3d-shared = { version = "0.1.0", path = "../shared" }
 thiserror = "2.0.21"
 tracing = "0.1.44"
-windows = "0.62.2"
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_System_LibraryLoader", "Win32_System_ProcessStatus", "Win32_System_Threading"] }

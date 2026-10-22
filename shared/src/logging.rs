@@ -20,12 +20,16 @@ pub const LOG_ENV_VAR: &str = "S3D_LOG";
 /// Daily files kept per program before the oldest is deleted.
 pub const MAX_LOG_FILES: usize = 7;
 
-/// Returns `%LOCALAPPDATA%\Stereophonics3D\logs`.
+/// Returns `%LOCALAPPDATA%\Stereophonics3D\logs`, or the directory in `S3D_LOG_DIR` when
+/// set.
 ///
 /// # Errors
 ///
-/// Returns [`Error::NoLocalAppData`] when `LOCALAPPDATA` is unset.
+/// Returns [`Error::NoLocalAppData`] when neither variable is set.
 pub fn default_log_dir() -> Result<PathBuf> {
+    if let Some(dir) = std::env::var_os(crate::layer::LOG_DIR_ENV) {
+        return Ok(PathBuf::from(dir));
+    }
     std::env::var_os("LOCALAPPDATA")
         .map(|base| PathBuf::from(base).join("Stereophonics3D").join("logs"))
         .ok_or(Error::NoLocalAppData)

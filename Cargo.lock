@@ -1457,6 +1457,9 @@ name = "s3d-install"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "clap",
+ "s3d-shared",
+ "serde_json",
  "windows",
 ]
 
@@ -1465,6 +1468,7 @@ name = "s3d-layer"
 version = "0.1.0"
 dependencies = [
  "ash",
+ "s3d-shared",
  "thiserror 2.0.21",
  "tracing",
  "windows",
@@ -1524,6 +1528,7 @@ dependencies = [
  "s3d-shared",
  "s3d-verify",
  "tracing",
+ "windows",
  "winit",
 ]
 
