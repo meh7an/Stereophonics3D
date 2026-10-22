@@ -1,0 +1,27 @@
+; Two vertex entry points sharing one decorated Position variable; each must see only
+; the store made by its own function.
+               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Vertex %main_a "a" %position
+               OpEntryPoint Vertex %main_b "b" %position
+               OpDecorate %position BuiltIn Position
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+      %float = OpTypeFloat 32
+    %v4float = OpTypeVector %float 4
+%ptr_out_v4 = OpTypePointer Output %v4float
+   %position = OpVariable %ptr_out_v4 Output
+    %float_0 = OpConstant %float 0
+    %float_1 = OpConstant %float 1
+   %value_a = OpConstantComposite %v4float %float_0 %float_0 %float_0 %float_1
+   %value_b = OpConstantComposite %v4float %float_1 %float_1 %float_0 %float_1
+     %main_a = OpFunction %void None %fn
+    %label_a = OpLabel
+               OpStore %position %value_a
+               OpReturn
+               OpFunctionEnd
+     %main_b = OpFunction %void None %fn
+    %label_b = OpLabel
+               OpStore %position %value_b
+               OpReturn
+               OpFunctionEnd

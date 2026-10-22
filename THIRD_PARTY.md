@@ -9,6 +9,12 @@ recorded here in the same change that adds it.
 | Source | Licence | What was taken | Where it lives |
 |---|---|---|---|
 
+## Statically Linked Libraries
+
+| Library | Licence | Source | Linked into |
+|---|---|---|---|
+| SPIRV-Tools (`SPIRV-Tools.lib`, validator C API) | Apache-2.0 | LunarG Vulkan SDK 1.4.363.0 | `s3d-spirv-val` and every binary that depends on it |
+
 ## Crate Dependencies
 
 Crates pulled from crates.io keep their own licences. The full list is generated from
