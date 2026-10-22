@@ -1,0 +1,17 @@
+# Global Stereophonics3D settings: %APPDATA%\Stereophonics3D\config.toml
+# Every value shown is the built-in default.
+
+[stereo]
+# Disparity between the eyes at infinite depth, in percent of screen width.
+max_parallax_percent = 3.0
+# View depth (clip-space w) at which both eyes coincide.
+convergence = 4.0
+# Exchange the eyes, for glasses worn the other way round.
+swap_eyes = false
+
+[anaglyph]
+# A preset (dubois-2001, dubois-2009, zhang-lcd, color, half-color, gray) or three rows
+# of six coefficients: left R, G, B then right R, G, B, applied in linear light.
+matrix = "dubois-2001"
+brightness = 1.0
+gamma = 1.0

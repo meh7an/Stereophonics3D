@@ -1,0 +1,22 @@
+# Per-game profile: %APPDATA%\Stereophonics3D\profiles\<name>.toml
+# Only processes with a matching profile get stereo; everything else is pass-through.
+executable = "ExampleGame.exe"
+
+# Any [stereo] or [anaglyph] key overrides the global value for this game only.
+[stereo]
+convergence = 12.5
+
+[anaglyph]
+matrix = [
+    [1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    [0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+    [0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+]
+
+# Keyed by the 16-hex-digit shader hash shown in dumps and hunting mode.
+[shaders]
+"9f2c4a1b0d3e5f67" = "skip"
+"0123456789abcdef" = "mono"
+"00000000000000bb" = "stereo"
+"fedcba9876543210" = { hud_depth = 1.5 }
+"00000000000000aa" = "sky"

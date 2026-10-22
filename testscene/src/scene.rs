@@ -10,6 +10,7 @@ mod geometry;
 
 use clap::ValueEnum;
 use glam::{Mat3, Mat4, Vec3, camera::rh};
+pub use s3d_shared::capture::MarkerKind;
 
 /// Background colour of every scene, chosen to differ from all marker colours.
 pub const CLEAR_COLOR: [u8; 3] = [16, 16, 16];
@@ -165,15 +166,6 @@ impl ShadowVolume {
         let projection = rh::proj::vulkan::orthographic(-h, h, -h, h, 0.1, self.distance * 2.0);
         projection * view
     }
-}
-
-/// Where a marker's centre is expressed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MarkerKind {
-    /// World-space position rasterised through the camera.
-    World,
-    /// Clip-space position drawn with w = 1 by the HUD pass.
-    Hud,
 }
 
 /// Ground truth for one identifiable object.

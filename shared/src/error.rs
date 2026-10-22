@@ -39,6 +39,48 @@ pub enum Error {
     /// Another global tracing subscriber is already installed in this process.
     #[error("a global log subscriber is already installed")]
     LoggerAlreadySet(#[source] SetGlobalDefaultError),
+
+    /// A file could not be read or written.
+    #[error("cannot access {path}")]
+    Io {
+        /// File that failed.
+        path: PathBuf,
+        /// Underlying filesystem failure.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// A sidecar did not match the JSON schema.
+    #[error("invalid sidecar {path}")]
+    Json {
+        /// File that failed.
+        path: PathBuf,
+        /// Underlying parse or serialization failure.
+        #[source]
+        source: serde_json::Error,
+    },
+
+    /// Pixels could not be encoded as PNG.
+    #[error("cannot encode PNG")]
+    PngEncode(#[from] png::EncodingError),
+
+    /// A PNG could not be decoded.
+    #[error("cannot decode PNG")]
+    PngDecode(#[from] png::DecodingError),
+
+    /// A PNG decoded, but not as 8-bit RGBA.
+    #[error("expected an 8-bit RGBA PNG, found {found}")]
+    UnsupportedPng {
+        /// Colour type and depth found.
+        found: String,
+    },
+
+    /// Text is not 16 hex digits.
+    #[error("invalid shader hash {text:?}; expected 16 hex digits")]
+    InvalidShaderHash {
+        /// The rejected text.
+        text: String,
+    },
 }
 
 /// Result alias for `s3d-shared`.

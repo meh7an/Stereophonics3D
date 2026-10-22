@@ -127,7 +127,7 @@ impl App {
         let needs_pixels = last && (self.args.capture.is_some() || self.args.self_check);
         if let Some(rgba) = renderer.render(&scene, needs_pixels)? {
             if let Some(dir) = &self.args.capture {
-                let sidecar = capture::Sidecar::new(&scene, (WIDTH, HEIGHT), self.args.rendering);
+                let sidecar = capture::sidecar(&scene, (WIDTH, HEIGHT), self.args.rendering.name());
                 let path = capture::write(dir, &rgba, &sidecar)?;
                 tracing::info!(path = %path.display(), "captured frame");
                 println!("captured {}", path.display());
