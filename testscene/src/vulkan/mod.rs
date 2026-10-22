@@ -1,0 +1,26 @@
+//! Vulkan 1.3 backend for the test scene.
+//!
+//! Types here hold raw `ash` handles, which do not implement `Debug`, so they derive
+//! nothing and release their handles in `Drop`.
+
+mod context;
+mod memory;
+mod pipeline;
+mod renderer;
+mod swapchain;
+
+use clap::ValueEnum;
+use serde::Serialize;
+
+pub use context::validation_error_count;
+pub use renderer::Renderer;
+
+/// How draws are wrapped, so the layer is exercised on both paths games use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RenderingMode {
+    /// `VkRenderPass` and framebuffers.
+    Pass,
+    /// Core 1.3 dynamic rendering (`vkCmdBeginRendering`).
+    Dynamic,
+}

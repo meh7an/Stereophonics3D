@@ -14,12 +14,40 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Must match the SDK recorded in progress.md; build.rs needs its glslc.
+  VULKAN_SDK_VERSION: 1.4.363.0
 
 jobs:
   check:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Cache Vulkan SDK
+        id: vulkan-sdk
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: C:\VulkanSDK
+          key: vulkan-sdk-${{ env.VULKAN_SDK_VERSION }}
+
+      - name: Install Vulkan SDK
+        if: steps.vulkan-sdk.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $version = $env:VULKAN_SDK_VERSION
+          $installer = Join-Path $env:RUNNER_TEMP 'vulkansdk.exe'
+          $url = "https://sdk.lunarg.com/sdk/download/$version/windows/vulkansdk-windows-X64-$version.exe"
+          Invoke-WebRequest -Uri $url -OutFile $installer
+          $arguments = "--root C:\VulkanSDK\$version --accept-licenses --default-answer --confirm-command install"
+          $process = Start-Process -FilePath $installer -ArgumentList $arguments -Wait -PassThru
+          if ($process.ExitCode -ne 0) { exit $process.ExitCode }
+
+      - name: Use Vulkan SDK
+        shell: pwsh
+        run: |
+          $sdk = "C:\VulkanSDK\$env:VULKAN_SDK_VERSION"
+          if (-not (Test-Path "$sdk\Bin\glslc.exe")) { throw "glslc missing from $sdk" }
+          "VULKAN_SDK=$sdk" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       # rustup auto-installs the toolchain pinned in rust-toolchain.toml on first use.
       - name: Install pinned toolchain

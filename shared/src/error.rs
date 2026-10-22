@@ -16,6 +16,16 @@ pub enum Error {
     #[error("LOCALAPPDATA is not set; no default log directory")]
     NoLocalAppData,
 
+    /// The log directory could not be created.
+    #[error("failed to create log directory {dir}")]
+    LogDir {
+        /// Directory that could not be created.
+        dir: PathBuf,
+        /// Underlying filesystem failure.
+        #[source]
+        source: std::io::Error,
+    },
+
     /// The rolling log file could not be created.
     #[error("failed to open a log file in {dir}")]
     LogFile {

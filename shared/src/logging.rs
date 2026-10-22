@@ -38,8 +38,15 @@ pub fn default_log_dir() -> Result<PathBuf> {
 ///
 /// # Errors
 ///
-/// Returns [`Error::LogFile`] when the directory or file cannot be created.
+/// Returns [`Error::LogDir`] or [`Error::LogFile`] when the directory or file cannot be
+/// created.
 pub fn file_dispatch(dir: &Path, program: &str) -> Result<(Dispatch, WorkerGuard)> {
+    // The appender prunes old files before creating the directory and prints an error to
+    // stderr when it is missing, so the directory must exist first.
+    std::fs::create_dir_all(dir).map_err(|source| Error::LogDir {
+        dir: dir.to_path_buf(),
+        source,
+    })?;
     let appender = RollingFileAppender::builder()
         .rotation(Rotation::DAILY)
         .filename_prefix(program)
