@@ -31,6 +31,7 @@ pub fn sidecar(scene: &Scene, size: (u32, u32), rendering: &str) -> Sidecar {
         projection: camera.projection(scene.aspect).to_cols_array(),
         convergence: scene.convergence,
         clear_color: CLEAR_COLOR,
+        backdrop_color: scene.backdrop,
         light: scene.light.map(|light| LightRecord {
             direction: light.direction.to_array(),
             shadows: light.shadow.is_some(),

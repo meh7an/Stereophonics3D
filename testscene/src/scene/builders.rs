@@ -118,6 +118,7 @@ pub(super) fn build(id: SceneId, aspect: f32, frame: u32) -> Scene {
         markers: parts.markers,
         probes: parts.probes,
         counter: parts.counter,
+        backdrop: parts.backdrop,
     }
 }
 
@@ -182,6 +183,7 @@ struct Parts {
     markers: Vec<Marker>,
     probes: Vec<Probe>,
     counter: Option<u32>,
+    backdrop: Option<[u8; 3]>,
 }
 
 impl Parts {
@@ -191,6 +193,7 @@ impl Parts {
         self.markers.extend(other.markers);
         self.probes.extend(other.probes);
         self.counter = self.counter.or(other.counter);
+        self.backdrop = self.backdrop.or(other.backdrop);
     }
 
     /// Mesh whose vertices are in the camera's view space.
@@ -233,6 +236,7 @@ fn backdrop(ctx: &Ctx, depth: f32, color: [u8; 3]) -> Parts {
         rgba(color, 1.0),
     );
     parts.view_mesh(ctx, Material::Unlit, vertices.to_vec());
+    parts.backdrop = Some(color);
     parts
 }
 

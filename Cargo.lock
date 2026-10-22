@@ -1522,6 +1522,7 @@ dependencies = [
  "clap",
  "glam",
  "s3d-shared",
+ "s3d-verify",
  "tracing",
  "winit",
 ]
@@ -1529,6 +1530,15 @@ dependencies = [
 [[package]]
 name = "s3d-verify"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "s3d-math",
+ "s3d-shared",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+]
 
 [[package]]
 name = "same-file"

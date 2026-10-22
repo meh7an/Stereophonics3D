@@ -5,7 +5,6 @@
 //! of by eye.
 
 mod capture;
-mod probe;
 mod scene;
 mod vulkan;
 
@@ -14,6 +13,7 @@ use std::path::PathBuf;
 use anyhow::{Result, bail};
 use ash::vk;
 use clap::Parser;
+use s3d_shared::capture::Image;
 use winit::{
     application::ApplicationHandler,
     dpi::PhysicalSize,
@@ -173,7 +173,13 @@ fn self_check(scene: &Scene, rgba: &[u8]) -> Result<()> {
         println!("self-check: scene {} has no counter", scene.id.name());
         return Ok(());
     };
-    let decoded = probe::decode_counter(rgba, WIDTH, HEIGHT, &scene.probes)?;
+    let probes = capture::sidecar(scene, (WIDTH, HEIGHT), "").probes;
+    let image = Image {
+        width: WIDTH,
+        height: HEIGHT,
+        rgba: rgba.to_vec(),
+    };
+    let decoded = s3d_verify::counter::decode(&image, &probes)?;
     if decoded != expected {
         bail!("self-check: counter reads {decoded}, frame encodes {expected}");
     }

@@ -214,6 +214,8 @@ pub struct Scene {
     pub probes: Vec<Probe>,
     /// Value the counter probes encode, when the scene has a counter.
     pub counter: Option<u32>,
+    /// Colour of the opaque wall behind the content, when the scene has one.
+    pub backdrop: Option<[u8; 3]>,
 }
 
 impl Scene {

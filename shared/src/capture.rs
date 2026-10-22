@@ -30,6 +30,10 @@ pub struct Sidecar {
     pub projection: [f32; 16],
     pub convergence: f32,
     pub clear_color: [u8; 3],
+    /// Colour of the opaque wall behind the scene, when it has one; transparent layers
+    /// blend over it.
+    #[serde(default)]
+    pub backdrop_color: Option<[u8; 3]>,
     pub light: Option<LightRecord>,
     pub sky: bool,
     /// The frame went through a tone-map pass, so absolute colours differ.
@@ -287,6 +291,7 @@ mod tests {
             projection: [0.0; 16],
             convergence: 4.0,
             clear_color: [16, 16, 16],
+            backdrop_color: Some([30, 30, 36]),
             light: None,
             sky: false,
             post: false,
@@ -365,6 +370,16 @@ mod tests {
         assert_eq!(json["markers"][0]["kind"], "world");
         assert_eq!(json["stereo"]["method"], "single-eye");
         assert_eq!(json["stereo"]["eyes"][0], "left");
+    }
+
+    #[test]
+    fn test_sidecar_without_backdrop_field_still_loads() {
+        let mut json = serde_json::to_value(sidecar()).expect("serialize");
+        json.as_object_mut()
+            .expect("object")
+            .remove("backdrop_color");
+        let loaded: Sidecar = serde_json::from_value(json).expect("older sidecar loads");
+        assert_eq!(loaded.backdrop_color, None);
     }
 
     #[test]
