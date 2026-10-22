@@ -1,13 +1,23 @@
 //! Vulkan implicit layer that injects same-frame geometric stereo.
 //!
-//! M3.1 skeleton: negotiates loader interface version 2, keeps per-instance and per-device
-//! dispatch data, and stays pure pass-through unless a profile opts the process in (and
-//! no anti-cheat module is loaded), in which case it counts presented frames.
+//! Negotiates loader interface version 2, keeps per-instance and per-device dispatch
+//! data, and stays pure pass-through unless a profile opts the process in (and no
+//! anti-cheat module is loaded). Active processes get their shader modules, pipelines and
+//! command buffers tracked, interception-defeating extensions hidden, shaders optionally
+//! dumped, and draws of profile-skipped shaders dropped.
+
+#[macro_use]
+mod macros;
 
 mod activation;
+mod chain;
+mod commands;
 mod dispatch;
+mod dump;
+mod extensions;
 mod hooks;
 mod loader;
+mod pipelines;
 
 use std::ffi::c_char;
 

@@ -15,6 +15,8 @@ pub const DISABLE_ENV: &str = "DISABLE_S3D_LAYER";
 pub const CONFIG_DIR_ENV: &str = "S3D_CONFIG_DIR";
 /// Overrides `%LOCALAPPDATA%\Stereophonics3D\logs` as the log directory.
 pub const LOG_DIR_ENV: &str = "S3D_LOG_DIR";
+/// Overrides `%LOCALAPPDATA%\Stereophonics3D\dumps` as the shader dump directory.
+pub const DUMP_DIR_ENV: &str = "S3D_DUMP_DIR";
 
 /// User-mode modules of anti-cheat systems, as (lower-case file-name prefix, product).
 /// Kernel-only systems leave nothing to detect here; extend this list as products are

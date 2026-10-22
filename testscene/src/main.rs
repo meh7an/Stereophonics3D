@@ -62,6 +62,10 @@ struct Args {
     /// layer's anti-cheat refusal; repeatable.
     #[arg(long)]
     preload: Vec<PathBuf>,
+
+    /// Print the device's extensions and the layer-hidden feature bits after start-up.
+    #[arg(long)]
+    list_device_extensions: bool,
 }
 
 fn main() -> Result<()> {
@@ -118,6 +122,9 @@ impl App {
             self.args.rendering,
             self.args.validate,
         )?;
+        if self.args.list_device_extensions {
+            renderer.print_device_report()?;
+        }
         window.request_redraw();
         self.renderer = Some(renderer);
         self.window = Some(window);

@@ -135,6 +135,45 @@ impl Context {
     }
 }
 
+impl Context {
+    /// Prints the selected device's extensions as `extension <name>` lines, then the
+    /// feature bits the Stereophonics3D layer clears as `feature <name> <0|1>` lines, so
+    /// a run with the layer active shows what the application can see.
+    pub fn print_device_report(&self) -> Result<()> {
+        let extensions = unsafe {
+            self.instance
+                .enumerate_device_extension_properties(self.physical_device)?
+        };
+        for extension in &extensions {
+            let name = extension.extension_name_as_c_str()?;
+            println!("extension {}", name.to_string_lossy());
+        }
+        let mut object = vk::PhysicalDeviceShaderObjectFeaturesEXT::default();
+        let mut library = vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT::default();
+        let mut identifier = vk::PhysicalDeviceShaderModuleIdentifierFeaturesEXT::default();
+        {
+            let mut features = vk::PhysicalDeviceFeatures2::default()
+                .push_next(&mut object)
+                .push_next(&mut library)
+                .push_next(&mut identifier);
+            unsafe {
+                self.instance
+                    .get_physical_device_features2(self.physical_device, &mut features)
+            };
+        }
+        println!("feature shaderObject {}", object.shader_object);
+        println!(
+            "feature graphicsPipelineLibrary {}",
+            library.graphics_pipeline_library
+        );
+        println!(
+            "feature shaderModuleIdentifier {}",
+            identifier.shader_module_identifier
+        );
+        Ok(())
+    }
+}
+
 impl Drop for Context {
     fn drop(&mut self) {
         unsafe {

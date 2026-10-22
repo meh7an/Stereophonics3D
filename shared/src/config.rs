@@ -17,6 +17,15 @@ use crate::{AnaglyphSettings, MatrixChoice, ShaderHash, StereoParams};
 pub struct Config {
     pub stereo: StereoParams,
     pub anaglyph: AnaglyphSettings,
+    pub dump: DumpSettings,
+}
+
+/// Debug output written while a game runs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct DumpSettings {
+    /// Write every shader the game creates as `.spv` plus `.spvasm` disassembly.
+    pub shaders: bool,
 }
 
 /// One game's settings. A process without a matching profile stays pass-through.
@@ -29,6 +38,8 @@ pub struct Profile {
     pub stereo: StereoOverrides,
     #[serde(default)]
     pub anaglyph: AnaglyphOverrides,
+    #[serde(default)]
+    pub dump: DumpOverrides,
     /// Per-shader behaviour keyed by `ShaderHash`; wins over automatic classification.
     #[serde(default)]
     pub shaders: BTreeMap<ShaderHash, ShaderOverride>,
@@ -56,6 +67,14 @@ pub struct AnaglyphOverrides {
     pub brightness: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gamma: Option<f32>,
+}
+
+/// Dump fields a profile may replace; `None` keeps the global value.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct DumpOverrides {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shaders: Option<bool>,
 }
 
 /// How draws using one pre-raster shader are treated.
@@ -112,6 +131,9 @@ impl Config {
                 matrix: anaglyph.matrix.unwrap_or(self.anaglyph.matrix),
                 brightness: anaglyph.brightness.unwrap_or(self.anaglyph.brightness),
                 gamma: anaglyph.gamma.unwrap_or(self.anaglyph.gamma),
+            },
+            dump: DumpSettings {
+                shaders: profile.dump.shaders.unwrap_or(self.dump.shaders),
             },
         }
     }
@@ -242,6 +264,9 @@ mod tests {
                 matrix: Some(MatrixChoice::Preset(AnaglyphPreset::ZhangLcd)),
                 ..AnaglyphOverrides::default()
             },
+            dump: DumpOverrides {
+                shaders: Some(true),
+            },
             shaders: BTreeMap::from([
                 (hash("00000000000000aa"), ShaderOverride::Skip),
                 (hash("00000000000000bb"), ShaderOverride::HudDepth(1.5)),
@@ -345,6 +370,7 @@ mod tests {
             MatrixChoice::Preset(AnaglyphPreset::ZhangLcd)
         );
         assert_eq!(merged.anaglyph.gamma, config.anaglyph.gamma);
+        assert!(merged.dump.shaders);
     }
 
     #[test]

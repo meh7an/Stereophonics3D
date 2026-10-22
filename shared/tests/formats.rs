@@ -29,6 +29,7 @@ fn test_profile_fixture_parses_every_override_kind() {
     assert_eq!(profile.executable, "ExampleGame.exe");
     assert_eq!(profile.stereo.convergence, Some(12.5));
     assert_eq!(profile.stereo.max_parallax_percent, None);
+    assert_eq!(profile.dump.shaders, Some(true));
     assert_eq!(
         profile.anaglyph.matrix.map(MatrixChoice::matrix),
         Some(AnaglyphPreset::Color.matrix())

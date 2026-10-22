@@ -366,6 +366,11 @@ impl Renderer {
 
     /// Renders and presents one frame of `scene`. With `capture`, also returns the
     /// presented image as tightly packed RGBA8 rows, top to bottom.
+    /// See [`Context::print_device_report`].
+    pub fn print_device_report(&self) -> Result<()> {
+        self.ctx.print_device_report()
+    }
+
     pub fn render(&mut self, scene: &Scene, capture: bool) -> Result<Option<Vec<u8>>> {
         let device = &self.ctx.device;
         unsafe {

@@ -12,11 +12,11 @@
 
 use std::{
     any::Any,
-    sync::{Mutex, OnceLock, PoisonError},
+    sync::{Arc, Mutex, OnceLock, PoisonError},
 };
 
 use s3d_shared::{
-    ConfigWatcher, Loader,
+    ConfigWatcher, Loader, Snapshot, SnapshotHandle,
     layer::anti_cheat_for,
     logging,
     settings::{current_executable_name, default_config_dir},
@@ -39,8 +39,19 @@ use windows::{
 /// The outcome of the gate, decided once per process.
 pub struct Activation {
     pub active: bool,
-    /// Keeps live settings flowing while active; read from M3.3 on.
+    /// File name of the running executable.
+    pub executable: String,
+    /// Live settings while active.
+    snapshot: Option<SnapshotHandle>,
+    /// Keeps `snapshot` updated on every configuration change.
     _watcher: Option<ConfigWatcher>,
+}
+
+impl Activation {
+    /// The current settings; `None` while pass-through.
+    pub fn snapshot(&self) -> Option<Arc<Snapshot>> {
+        self.snapshot.as_ref().map(SnapshotHandle::current)
+    }
 }
 
 static ACTIVATION: OnceLock<Activation> = OnceLock::new();
@@ -64,6 +75,8 @@ fn decide() -> Activation {
 
     let pass_through = Activation {
         active: false,
+        executable: executable.clone(),
+        snapshot: None,
         _watcher: None,
     };
     if let Some((module, product)) = loaded_anti_cheat() {
@@ -94,6 +107,8 @@ fn decide() -> Activation {
             tracing::info!(profile = %settings.profile.display(), "active");
             Activation {
                 active: true,
+                snapshot: Some(watcher.handle()),
+                executable,
                 _watcher: Some(watcher),
             }
         }

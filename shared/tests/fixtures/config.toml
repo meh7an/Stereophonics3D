@@ -15,3 +15,8 @@ swap_eyes = false
 matrix = "dubois-2001"
 brightness = 1.0
 gamma = 1.0
+
+[dump]
+# Write every shader the game creates to %LOCALAPPDATA%\Stereophonics3D\dumps\<exe>\
+# as <hash>.spv plus <hash>.spvasm disassembly.
+shaders = false

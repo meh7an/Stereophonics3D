@@ -14,8 +14,8 @@ use serde::de::DeserializeOwned;
 use toml::de::{DeTable, DeValue};
 
 use crate::{
-    AnaglyphSettings, Config, Error, Profile, Result, ShaderHash, ShaderOverride, StereoParams,
-    config::Issue,
+    AnaglyphSettings, Config, DumpSettings, Error, Profile, Result, ShaderHash, ShaderOverride,
+    StereoParams, config::Issue,
 };
 
 const CONFIG_FILE: &str = "config.toml";
@@ -34,6 +34,20 @@ pub fn default_config_dir() -> Result<PathBuf> {
     std::env::var_os("APPDATA")
         .map(|base| PathBuf::from(base).join("Stereophonics3D"))
         .ok_or(Error::NoAppData)
+}
+
+/// `%LOCALAPPDATA%\Stereophonics3D\dumps`, or the directory in `S3D_DUMP_DIR` when set.
+///
+/// # Errors
+///
+/// Returns [`Error::NoLocalAppData`] when neither variable is set.
+pub fn default_dump_dir() -> Result<PathBuf> {
+    if let Some(dir) = std::env::var_os(crate::layer::DUMP_DIR_ENV) {
+        return Ok(PathBuf::from(dir));
+    }
+    std::env::var_os("LOCALAPPDATA")
+        .map(|base| PathBuf::from(base).join("Stereophonics3D").join("dumps"))
+        .ok_or(Error::NoLocalAppData)
 }
 
 /// File name of the running executable, the key profiles are matched against.
@@ -71,6 +85,7 @@ impl fmt::Display for Diagnostic {
 pub struct Settings {
     pub stereo: StereoParams,
     pub anaglyph: AnaglyphSettings,
+    pub dump: DumpSettings,
     pub shaders: BTreeMap<ShaderHash, ShaderOverride>,
     /// Profile file the settings came from.
     pub profile: PathBuf,
@@ -162,6 +177,7 @@ impl Loader {
             Settings {
                 stereo: merged.stereo,
                 anaglyph: merged.anaglyph,
+                dump: merged.dump,
                 shaders: profile.shaders.clone(),
                 profile: (*path).clone(),
             }
