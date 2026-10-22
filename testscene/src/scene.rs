@@ -2,19 +2,55 @@
 //!
 //! Scenes describe geometry, camera and ground truth only; the Vulkan backend here and the
 //! later D3D12 backend both consume them unchanged, so captures from either API can be
-//! checked against the same sidecar data.
+//! checked against the same sidecar data. A scene is rebuilt for every frame from the frame
+//! index alone, which keeps animation deterministic.
+
+mod builders;
+mod geometry;
 
 use clap::ValueEnum;
-use glam::{Mat4, Vec3, camera::rh};
+use glam::{Mat3, Mat4, Vec3, camera::rh};
 
 /// Background colour of every scene, chosen to differ from all marker colours.
 pub const CLEAR_COLOR: [u8; 3] = [16, 16, 16];
 
+/// Fixed time step: frame `n` shows time `n / FRAME_RATE` seconds.
+pub const FRAME_RATE: f32 = 60.0;
+
+/// Exposure of the tone-map pass, handed to `tonemap.frag` as specialization constant 0.
+pub const TONEMAP_EXPOSURE: f32 = 1.6;
+
+/// An 8-bit colour as it appears after the tone-map pass (Reinhard on exposed input).
+pub fn tonemapped(color: [u8; 3]) -> [u8; 3] {
+    color.map(|channel| {
+        let exposed = f32::from(channel) / 255.0 * TONEMAP_EXPOSURE;
+        (exposed / (1.0 + exposed) * 255.0).round() as u8
+    })
+}
+
 /// Scenes the test application can render.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum SceneId {
-    /// Marker grid at known depths for the G0 geometry sanity test.
+    /// Marker grid at known depths (G0 geometry sanity).
     G0,
+    /// Pillar in front of a wall hiding a high-frequency marker (G1 disocclusion).
+    G1,
+    /// Alpha-blended quad stack and particles (G2 transparents).
+    G2,
+    /// Lateral mover at convergence depth plus a frame counter (G3 same-frame).
+    G3,
+    /// Glossy sphere and reflector under a fixed light (G5 view-dependent shading).
+    G5,
+    /// Depth-only shadow-map pass feeding a lit scene.
+    Shadow,
+    /// Screen-space HUD pass drawn at w = 1.
+    Hud,
+    /// Skybox drawn on the far plane.
+    Sky,
+    /// Scene rendered to an HDR target and tone-mapped to the swapchain.
+    Post,
+    /// Every element above in one frame, for smoke runs.
+    All,
 }
 
 impl SceneId {
@@ -22,12 +58,21 @@ impl SceneId {
     pub fn name(self) -> &'static str {
         match self {
             Self::G0 => "g0",
+            Self::G1 => "g1",
+            Self::G2 => "g2",
+            Self::G3 => "g3",
+            Self::G5 => "g5",
+            Self::Shadow => "shadow",
+            Self::Hud => "hud",
+            Self::Sky => "sky",
+            Self::Post => "post",
+            Self::All => "all",
         }
     }
 }
 
 /// Right-handed, Y-up camera looking along `target - position`.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Camera {
     pub position: Vec3,
     pub target: Vec3,
@@ -54,44 +99,135 @@ impl Camera {
     }
 }
 
-/// An unlit, camera-facing square with a unique colour.
-#[derive(Debug, Clone, Copy)]
+/// Which pipeline draws a mesh.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Material {
+    /// Vertex colour, opaque.
+    Unlit,
+    /// Fine checker between the vertex colour and green, opaque.
+    Pattern,
+    /// Blinn-Phong with shadows from the frame's light.
+    Lit,
+    /// Mirror-like reflection of the procedural environment.
+    Reflective,
+    /// Vertex colour with alpha blending and no depth writes; drawn after the skybox.
+    Transparent,
+}
+
+/// One vertex of any mesh. HUD vertices carry clip-space positions.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Vertex {
+    pub position: Vec3,
+    pub normal: Vec3,
+    /// Linear RGBA in [0, 1]; written unchanged to UNORM targets.
+    pub color: [f32; 4],
+    pub uv: [f32; 2],
+}
+
+/// Triangle list drawn with one pipeline and one model matrix.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Mesh {
+    pub material: Material,
+    pub model: Mat4,
+    pub vertices: Vec<Vertex>,
+}
+
+/// Directional light, optionally casting shadows.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Light {
+    /// Unit vector pointing toward the light.
+    pub direction: Vec3,
+    pub color: Vec3,
+    pub ambient: f32,
+    pub shadow: Option<ShadowVolume>,
+}
+
+/// Box covered by the orthographic shadow map.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ShadowVolume {
+    pub center: Vec3,
+    pub half_extent: f32,
+    /// Distance from `center` to the light's eye along the light direction.
+    pub distance: f32,
+}
+
+impl ShadowVolume {
+    /// Light view-projection for a light shining from `direction`.
+    pub fn view_proj(&self, direction: Vec3) -> Mat4 {
+        let eye = self.center + direction * self.distance;
+        let up = if direction.y.abs() > 0.99 {
+            Vec3::Z
+        } else {
+            Vec3::Y
+        };
+        let view = rh::view::look_at_mat4(eye, self.center, up);
+        let h = self.half_extent;
+        let projection = rh::proj::vulkan::orthographic(-h, h, -h, h, 0.1, self.distance * 2.0);
+        projection * view
+    }
+}
+
+/// Where a marker's centre is expressed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkerKind {
+    /// World-space position rasterised through the camera.
+    World,
+    /// Clip-space position drawn with w = 1 by the HUD pass.
+    Hud,
+}
+
+/// Ground truth for one identifiable object.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Marker {
     pub id: u32,
+    pub kind: MarkerKind,
     pub color: [u8; 3],
-    /// Centre in world space.
+    pub alpha: f32,
+    /// World position, or clip-space position with z = 0 for HUD markers.
     pub center: Vec3,
-    /// Half the edge length in world units.
-    pub half_size: f32,
-    /// Distance from the camera plane, equal to clip-space `w` at the centre.
+    /// Half extents along the camera's right and up axes, in world (or clip) units.
+    pub half_extent: [f32; 2],
+    /// Distance from the camera plane, equal to clip-space `w`; 1 for HUD markers.
     pub depth: f32,
 }
 
-/// One vertex of the scene mesh.
-#[derive(Debug, Clone, Copy)]
-pub struct Vertex {
-    pub position: Vec3,
-    /// Linear colour in [0, 1]; written unchanged to a UNORM target.
-    pub color: [f32; 3],
+/// One cell of the frame counter, read most significant bit first.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Probe {
+    pub bit: u32,
+    /// Vulkan NDC of the cell centre (y down).
+    pub ndc: [f32; 2],
+    pub on: [u8; 3],
+    pub off: [u8; 3],
 }
 
-/// A complete scene: camera, stereo reference depth and geometry.
-#[derive(Debug, Clone)]
+/// A complete frame of one scene.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Scene {
     pub id: SceneId,
+    pub frame: u32,
     pub camera: Camera,
     pub aspect: f32,
     /// Depth at which the stereo milestones place zero parallax.
     pub convergence: f32,
+    pub light: Option<Light>,
+    pub sky: bool,
+    /// Render to an HDR target and tone-map it to the swapchain.
+    pub post: bool,
+    /// Opaque meshes in draw order, then transparent meshes back to front.
+    pub meshes: Vec<Mesh>,
+    /// Clip-space triangles for the HUD pass.
+    pub hud: Vec<Vertex>,
     pub markers: Vec<Marker>,
+    pub probes: Vec<Probe>,
+    /// Value the counter probes encode, when the scene has a counter.
+    pub counter: Option<u32>,
 }
 
 impl Scene {
-    /// Builds the scene `id` for a target of the given aspect ratio.
-    pub fn build(id: SceneId, aspect: f32) -> Self {
-        match id {
-            SceneId::G0 => g0(aspect),
-        }
+    /// Builds frame `frame` of scene `id` for a target of the given aspect ratio.
+    pub fn build(id: SceneId, aspect: f32, frame: u32) -> Self {
+        builders::build(id, aspect, frame)
     }
 
     /// Combined view and projection transform.
@@ -99,75 +235,22 @@ impl Scene {
         self.camera.projection(self.aspect) * self.camera.view()
     }
 
-    /// Triangle list covering every marker, two triangles per marker.
-    pub fn vertices(&self) -> Vec<Vertex> {
-        self.markers.iter().flat_map(marker_vertices).collect()
-    }
-}
-
-const G0_DEPTHS: [f32; 5] = [1.5, 2.5, 4.0, 8.0, 20.0];
-const G0_COLUMNS_NDC: [f32; 5] = [-0.72, -0.36, 0.0, 0.36, 0.72];
-const G0_ROWS_NDC: [f32; 3] = [0.5, 0.0, -0.5];
-const G0_HALF_SIZE_NDC: f32 = 0.06;
-
-/// Places each depth in its own column, so no marker can hide another, and scales every
-/// marker by its depth so all of them cover the same screen area.
-fn g0(aspect: f32) -> Scene {
-    let camera = Camera {
-        position: Vec3::ZERO,
-        target: Vec3::NEG_Z,
-        up: Vec3::Y,
-        vertical_fov_deg: 60.0,
-        near: 0.1,
-        far: 100.0,
-    };
-    let tan_half_v = (camera.vertical_fov_deg.to_radians() / 2.0).tan();
-    let tan_half_h = tan_half_v * aspect;
-
-    let mut markers = Vec::with_capacity(G0_ROWS_NDC.len() * G0_DEPTHS.len());
-    for (row, &v) in G0_ROWS_NDC.iter().enumerate() {
-        for (column, (&u, &depth)) in G0_COLUMNS_NDC.iter().zip(&G0_DEPTHS).enumerate() {
-            markers.push(Marker {
-                id: (row * G0_DEPTHS.len() + column) as u32,
-                color: g0_color(row, column),
-                center: Vec3::new(u * depth * tan_half_h, v * depth * tan_half_v, -depth),
-                half_size: G0_HALF_SIZE_NDC * depth * tan_half_v,
-                depth,
-            });
-        }
+    /// View rotation (no translation) and projection, for the skybox.
+    pub fn sky_view_proj(&self) -> Mat4 {
+        let rotation = Mat4::from_mat3(Mat3::from_mat4(self.camera.view()));
+        self.camera.projection(self.aspect) * rotation
     }
 
-    Scene {
-        id: SceneId::G0,
-        camera,
-        aspect,
-        convergence: 4.0,
-        markers,
+    /// Light view-projection when the light casts shadows.
+    pub fn light_view_proj(&self) -> Option<Mat4> {
+        let light = self.light?;
+        light.shadow.map(|volume| volume.view_proj(light.direction))
     }
-}
 
-/// Unique per (row, column): red and blue encode the column, green the row.
-fn g0_color(row: usize, column: usize) -> [u8; 3] {
-    let column = column as u8;
-    let row = row as u8;
-    [55 + 50 * column, 60 + 70 * row, 220 - 40 * column]
-}
-
-fn marker_vertices(marker: &Marker) -> [Vertex; 6] {
-    let color = marker.color.map(|channel| f32::from(channel) / 255.0);
-    let h = marker.half_size;
-    let corner = |dx: f32, dy: f32| Vertex {
-        position: marker.center + Vec3::new(dx * h, dy * h, 0.0),
-        color,
-    };
-    [
-        corner(-1.0, -1.0),
-        corner(1.0, -1.0),
-        corner(1.0, 1.0),
-        corner(-1.0, -1.0),
-        corner(1.0, 1.0),
-        corner(-1.0, 1.0),
-    ]
+    /// Unit cube drawn around the camera when `sky` is set.
+    pub fn sky_vertices(&self) -> Vec<Vertex> {
+        geometry::cuboid(Vec3::ZERO, Vec3::ONE, [0.0; 4])
+    }
 }
 
 #[cfg(test)]
@@ -184,55 +267,52 @@ mod tests {
     }
 
     #[test]
-    fn test_g0_markers_unique_colors_distinct_from_clear() {
-        let scene = Scene::build(SceneId::G0, ASPECT);
-        let colors: HashSet<_> = scene.markers.iter().map(|m| m.color).collect();
-        assert_eq!(colors.len(), scene.markers.len());
-        assert!(!colors.contains(&CLEAR_COLOR));
+    fn test_every_scene_builds_deterministically_with_unique_ids() {
+        for id in SceneId::value_variants() {
+            for frame in [0, 37] {
+                let scene = Scene::build(*id, ASPECT, frame);
+                assert_eq!(scene, Scene::build(*id, ASPECT, frame), "{id:?}");
+                assert!(!scene.meshes.is_empty(), "{id:?}");
+                let ids: HashSet<_> = scene.markers.iter().map(|m| m.id).collect();
+                assert_eq!(ids.len(), scene.markers.len(), "{id:?}");
+            }
+        }
     }
 
     #[test]
-    fn test_g0_markers_some_nearer_than_convergence() {
-        let scene = Scene::build(SceneId::G0, ASPECT);
+    fn test_every_scene_marker_colors_distinct_from_clear() {
+        for id in SceneId::value_variants() {
+            let scene = Scene::build(*id, ASPECT, 0);
+            assert!(
+                scene.markers.iter().all(|m| m.color != CLEAR_COLOR),
+                "{id:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_g0_markers_unique_colors_and_six_nearer_than_convergence() {
+        let scene = Scene::build(SceneId::G0, ASPECT, 0);
+        let colors: HashSet<_> = scene.markers.iter().map(|m| m.color).collect();
+        assert_eq!(colors.len(), 15);
         let near = scene
             .markers
             .iter()
             .filter(|m| m.depth < scene.convergence)
             .count();
-        let at = scene
-            .markers
-            .iter()
-            .filter(|m| m.depth == scene.convergence)
-            .count();
         assert_eq!(near, 6);
-        assert_eq!(at, 3);
-    }
-
-    #[test]
-    fn test_g0_centers_project_to_layout_with_y_down() {
-        let scene = Scene::build(SceneId::G0, ASPECT);
-        for marker in &scene.markers {
-            let row = marker.id as usize / G0_DEPTHS.len();
-            let column = marker.id as usize % G0_DEPTHS.len();
-            let projected = ndc(&scene, marker.center);
-            assert!(
-                (projected.x - G0_COLUMNS_NDC[column]).abs() < 1e-5,
-                "{marker:?}"
-            );
-            assert!((projected.y + G0_ROWS_NDC[row]).abs() < 1e-5, "{marker:?}");
-            assert!((0.0..1.0).contains(&projected.z), "{marker:?}");
-        }
     }
 
     #[test]
     fn test_g0_markers_equal_screen_size_and_no_overlap() {
-        let scene = Scene::build(SceneId::G0, ASPECT);
+        let scene = Scene::build(SceneId::G0, ASPECT, 0);
         let rects: Vec<_> = scene
             .markers
             .iter()
             .map(|m| {
-                let low = ndc(&scene, m.center - Vec3::new(m.half_size, m.half_size, 0.0));
-                let high = ndc(&scene, m.center + Vec3::new(m.half_size, m.half_size, 0.0));
+                let [hx, hy] = m.half_extent;
+                let low = ndc(&scene, m.center - Vec3::new(hx, hy, 0.0));
+                let high = ndc(&scene, m.center + Vec3::new(hx, hy, 0.0));
                 (low.x, high.x, high.y.min(low.y), high.y.max(low.y))
             })
             .collect();
@@ -249,8 +329,82 @@ mod tests {
     }
 
     #[test]
-    fn test_scene_vertices_six_per_marker() {
-        let scene = Scene::build(SceneId::G0, ASPECT);
-        assert_eq!(scene.vertices().len(), scene.markers.len() * 6);
+    fn test_g1_pattern_hidden_behind_pillar_in_mono() {
+        let scene = Scene::build(SceneId::G1, ASPECT, 0);
+        let marker = |id| scene.markers.iter().find(|m| m.id == id).expect("marker");
+        let (pattern, pillar) = (marker(100), marker(101));
+        let x_range = |m: &Marker| {
+            let half = Vec3::new(m.half_extent[0], 0.0, 0.0);
+            let near_face = m.center + Vec3::new(0.0, 0.0, m.half_extent[0]);
+            let center = if m.id == 101 { near_face } else { m.center };
+            (ndc(&scene, center - half).x, ndc(&scene, center + half).x)
+        };
+        let (pattern_min, pattern_max) = x_range(pattern);
+        let (pillar_min, pillar_max) = x_range(pillar);
+        assert!(pattern_min > pillar_min && pattern_max < pillar_max);
+        assert!(pattern_min > 0.0, "pattern must sit on one side only");
+    }
+
+    #[test]
+    fn test_g2_transparent_mesh_sorted_back_to_front() {
+        let scene = Scene::build(SceneId::G2, ASPECT, 5);
+        let transparent: Vec<_> = scene
+            .meshes
+            .iter()
+            .filter(|m| m.material == Material::Transparent)
+            .collect();
+        assert_eq!(transparent.len(), 1);
+        let depths: Vec<f32> = transparent[0]
+            .vertices
+            .chunks(6)
+            .map(|quad| -quad[0].position.z)
+            .collect();
+        assert!(depths.windows(2).all(|pair| pair[0] >= pair[1]));
+    }
+
+    #[test]
+    fn test_g3_counter_and_mover_follow_frame() {
+        let frame = 0b1010_0000_0000_0101;
+        let scene = Scene::build(SceneId::G3, ASPECT, frame);
+        assert_eq!(scene.counter, Some(frame));
+        assert_eq!(scene.probes.len(), 16);
+        let mover = |frame| {
+            let scene = Scene::build(SceneId::G3, ASPECT, frame);
+            let marker = scene.markers.iter().find(|m| m.id == 400).expect("mover");
+            ndc(&scene, marker.center).x
+        };
+        assert!((mover(1) - mover(0) - 2.0 / FRAME_RATE).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_post_scene_probes_expect_tonemapped_colors() {
+        assert_eq!(tonemapped([255, 255, 255]), [157, 157, 157]);
+        let plain = Scene::build(SceneId::G3, ASPECT, 0);
+        let post = Scene::build(SceneId::All, ASPECT, 0);
+        assert_eq!(post.probes[0].on, tonemapped(plain.probes[0].on));
+        assert_eq!(post.probes[0].off, tonemapped(plain.probes[0].off));
+    }
+
+    #[test]
+    fn test_shadow_volume_contains_casters() {
+        let scene = Scene::build(SceneId::Shadow, ASPECT, 0);
+        let light = scene.light_view_proj().expect("shadowed light");
+        for marker in &scene.markers {
+            let p = light.project_point3(marker.center);
+            assert!(p.x.abs() < 1.0 && p.y.abs() < 1.0, "{marker:?}");
+            assert!((0.0..1.0).contains(&p.z), "{marker:?}");
+        }
+    }
+
+    #[test]
+    fn test_hud_markers_are_clip_space() {
+        let scene = Scene::build(SceneId::Hud, ASPECT, 0);
+        let hud: Vec<_> = scene
+            .markers
+            .iter()
+            .filter(|m| m.kind == MarkerKind::Hud)
+            .collect();
+        assert!(!hud.is_empty() && !scene.hud.is_empty());
+        assert!(hud.iter().all(|m| m.depth == 1.0 && m.center.z == 0.0));
     }
 }

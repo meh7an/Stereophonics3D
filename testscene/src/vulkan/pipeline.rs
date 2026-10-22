@@ -1,192 +1,351 @@
-//! The unlit pipeline, plus the render pass and framebuffers for `RenderingMode::Pass`.
+//! Descriptor set layouts, pipeline layouts and every graphics pipeline of the test scene.
 
 use std::io::Cursor;
 
 use anyhow::Result;
 use ash::{Device, vk};
 
-use super::{
-    RenderingMode,
-    swapchain::{DEPTH_FORMAT, Swapchain},
-};
+use super::passes::Pass;
+use crate::scene::{Material, TONEMAP_EXPOSURE};
 
-const VERTEX_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/unlit.vert.spv"));
-const FRAGMENT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/unlit.frag.spv"));
-
-/// Position then colour, three `f32` each.
-pub const VERTEX_STRIDE: u32 = 24;
-
-/// One `mat4` view-projection matrix for the vertex stage.
-pub const PUSH_CONSTANT_SIZE: u32 = 64;
-
-pub struct Pipeline {
-    pub handle: vk::Pipeline,
-    pub layout: vk::PipelineLayout,
-    /// `Some` only in pass mode; dynamic rendering needs neither.
-    pub render_pass: Option<vk::RenderPass>,
-    pub framebuffers: Vec<vk::Framebuffer>,
+macro_rules! spv {
+    ($name:literal) => {
+        include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv"))
+    };
 }
 
-impl Pipeline {
-    pub fn new(device: &Device, swapchain: &Swapchain, mode: RenderingMode) -> Result<Self> {
-        let render_pass = match mode {
-            RenderingMode::Pass => Some(create_render_pass(device, swapchain.format)?),
-            RenderingMode::Dynamic => None,
-        };
-        let framebuffers = match render_pass {
-            Some(render_pass) => create_framebuffers(device, swapchain, render_pass)?,
-            None => Vec::new(),
-        };
+/// Position, normal, RGBA colour and UV: 12 `f32`.
+pub const VERTEX_STRIDE: u32 = 48;
+
+/// One `mat4` model matrix for the vertex stage. The layer appends its own range after
+/// this, so it must stay the first and only application range.
+pub const PUSH_CONSTANT_SIZE: u32 = 64;
+
+/// Which vertex attributes a pipeline reads from the shared vertex buffer.
+#[derive(Clone, Copy)]
+enum Input {
+    Mesh,
+    Position,
+    PositionColor,
+    None,
+}
+
+#[derive(Clone, Copy)]
+enum Blend {
+    Opaque,
+    Alpha,
+}
+
+#[derive(Clone, Copy)]
+enum Depth {
+    Off,
+    Write,
+    ReadOnly(vk::CompareOp),
+}
+
+struct Desc<'a> {
+    vertex: &'a [u8],
+    fragment: Option<&'a [u8]>,
+    /// Fragment specialization constants; entry `i` sets `constant_id = i`.
+    fragment_constants: &'a [f32],
+    layout: vk::PipelineLayout,
+    input: Input,
+    blend: Blend,
+    depth: Depth,
+    depth_bias: bool,
+    pass: &'a Pass,
+}
+
+pub struct Pipelines {
+    pub frame_set_layout: vk::DescriptorSetLayout,
+    pub post_set_layout: vk::DescriptorSetLayout,
+    /// Frame set plus the model push constant; used by every mesh, sky and HUD pipeline.
+    pub mesh_layout: vk::PipelineLayout,
+    pub post_layout: vk::PipelineLayout,
+    pub unlit: vk::Pipeline,
+    pub pattern: vk::Pipeline,
+    pub lit: vk::Pipeline,
+    pub reflective: vk::Pipeline,
+    pub transparent: vk::Pipeline,
+    pub sky: vk::Pipeline,
+    pub shadow: vk::Pipeline,
+    pub hud: vk::Pipeline,
+    pub tonemap: Option<vk::Pipeline>,
+}
+
+impl Pipelines {
+    pub fn new(
+        device: &Device,
+        shadow_pass: &Pass,
+        main_pass: &Pass,
+        post_pass: Option<&Pass>,
+        hud_pass: &Pass,
+    ) -> Result<Self> {
+        let frame_set_layout = create_set_layout(
+            device,
+            &[
+                (
+                    vk::DescriptorType::UNIFORM_BUFFER,
+                    vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                ),
+                (
+                    vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                    vk::ShaderStageFlags::FRAGMENT,
+                ),
+            ],
+        )?;
+        let post_set_layout = create_set_layout(
+            device,
+            &[(
+                vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                vk::ShaderStageFlags::FRAGMENT,
+            )],
+        )?;
 
         let push_constants = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::VERTEX)
             .size(PUSH_CONSTANT_SIZE)];
-        let layout_info =
-            vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&push_constants);
-        let layout = unsafe { device.create_pipeline_layout(&layout_info, None)? };
+        let frame_sets = [frame_set_layout];
+        let mesh_layout = unsafe {
+            device.create_pipeline_layout(
+                &vk::PipelineLayoutCreateInfo::default()
+                    .set_layouts(&frame_sets)
+                    .push_constant_ranges(&push_constants),
+                None,
+            )?
+        };
+        let post_sets = [post_set_layout];
+        let post_layout = unsafe {
+            device.create_pipeline_layout(
+                &vk::PipelineLayoutCreateInfo::default().set_layouts(&post_sets),
+                None,
+            )?
+        };
 
-        let handle = create_pipeline(device, layout, render_pass, swapchain.format)?;
+        let mesh = |fragment: &'static [u8], blend, depth| Desc {
+            vertex: spv!("mesh.vert"),
+            fragment: Some(fragment),
+            fragment_constants: &[],
+            layout: mesh_layout,
+            input: Input::Mesh,
+            blend,
+            depth,
+            depth_bias: false,
+            pass: main_pass,
+        };
+        let unlit = create(
+            device,
+            &mesh(spv!("unlit.frag"), Blend::Opaque, Depth::Write),
+        )?;
+        let pattern = create(
+            device,
+            &mesh(spv!("pattern.frag"), Blend::Opaque, Depth::Write),
+        )?;
+        let lit = create(device, &mesh(spv!("lit.frag"), Blend::Opaque, Depth::Write))?;
+        let reflective = create(
+            device,
+            &mesh(spv!("reflect.frag"), Blend::Opaque, Depth::Write),
+        )?;
+        let transparent = create(
+            device,
+            &mesh(
+                spv!("unlit.frag"),
+                Blend::Alpha,
+                Depth::ReadOnly(vk::CompareOp::LESS),
+            ),
+        )?;
+        let sky = create(
+            device,
+            &Desc {
+                vertex: spv!("sky.vert"),
+                fragment: Some(spv!("sky.frag")),
+                input: Input::Position,
+                depth: Depth::ReadOnly(vk::CompareOp::LESS_OR_EQUAL),
+                ..mesh(spv!("unlit.frag"), Blend::Opaque, Depth::Off)
+            },
+        )?;
+        let shadow = create(
+            device,
+            &Desc {
+                vertex: spv!("shadow.vert"),
+                fragment: None,
+                fragment_constants: &[],
+                layout: mesh_layout,
+                input: Input::Position,
+                blend: Blend::Opaque,
+                depth: Depth::Write,
+                depth_bias: true,
+                pass: shadow_pass,
+            },
+        )?;
+        let hud = create(
+            device,
+            &Desc {
+                vertex: spv!("hud.vert"),
+                fragment: Some(spv!("hud.frag")),
+                fragment_constants: &[],
+                layout: mesh_layout,
+                input: Input::PositionColor,
+                blend: Blend::Alpha,
+                depth: Depth::Off,
+                depth_bias: false,
+                pass: hud_pass,
+            },
+        )?;
+        let tonemap = post_pass
+            .map(|pass| {
+                create(
+                    device,
+                    &Desc {
+                        vertex: spv!("fullscreen.vert"),
+                        fragment: Some(spv!("tonemap.frag")),
+                        fragment_constants: &[TONEMAP_EXPOSURE],
+                        layout: post_layout,
+                        input: Input::None,
+                        blend: Blend::Opaque,
+                        depth: Depth::Off,
+                        depth_bias: false,
+                        pass,
+                    },
+                )
+            })
+            .transpose()?;
+
         Ok(Self {
-            handle,
-            layout,
-            render_pass,
-            framebuffers,
+            frame_set_layout,
+            post_set_layout,
+            mesh_layout,
+            post_layout,
+            unlit,
+            pattern,
+            lit,
+            reflective,
+            transparent,
+            sky,
+            shadow,
+            hud,
+            tonemap,
         })
     }
 
+    pub fn for_material(&self, material: Material) -> vk::Pipeline {
+        match material {
+            Material::Unlit => self.unlit,
+            Material::Pattern => self.pattern,
+            Material::Lit => self.lit,
+            Material::Reflective => self.reflective,
+            Material::Transparent => self.transparent,
+        }
+    }
+
     pub fn destroy(&self, device: &Device) {
+        let pipelines = [
+            self.unlit,
+            self.pattern,
+            self.lit,
+            self.reflective,
+            self.transparent,
+            self.sky,
+            self.shadow,
+            self.hud,
+        ];
         unsafe {
-            device.destroy_pipeline(self.handle, None);
-            device.destroy_pipeline_layout(self.layout, None);
-            for &framebuffer in &self.framebuffers {
-                device.destroy_framebuffer(framebuffer, None);
+            for pipeline in pipelines.into_iter().chain(self.tonemap) {
+                device.destroy_pipeline(pipeline, None);
             }
-            if let Some(render_pass) = self.render_pass {
-                device.destroy_render_pass(render_pass, None);
-            }
+            device.destroy_pipeline_layout(self.mesh_layout, None);
+            device.destroy_pipeline_layout(self.post_layout, None);
+            device.destroy_descriptor_set_layout(self.frame_set_layout, None);
+            device.destroy_descriptor_set_layout(self.post_set_layout, None);
         }
     }
 }
 
-/// Final colour layout is `PRESENT_SRC_KHR`, as in a typical game. The outgoing dependency
-/// lets a capture copy follow the render pass in the same command buffer.
-fn create_render_pass(device: &Device, color_format: vk::Format) -> Result<vk::RenderPass> {
-    let attachments = [
-        vk::AttachmentDescription::default()
-            .format(color_format)
-            .samples(vk::SampleCountFlags::TYPE_1)
-            .load_op(vk::AttachmentLoadOp::CLEAR)
-            .store_op(vk::AttachmentStoreOp::STORE)
-            .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
-            .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
-            .initial_layout(vk::ImageLayout::UNDEFINED)
-            .final_layout(vk::ImageLayout::PRESENT_SRC_KHR),
-        vk::AttachmentDescription::default()
-            .format(DEPTH_FORMAT)
-            .samples(vk::SampleCountFlags::TYPE_1)
-            .load_op(vk::AttachmentLoadOp::CLEAR)
-            .store_op(vk::AttachmentStoreOp::DONT_CARE)
-            .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
-            .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
-            .initial_layout(vk::ImageLayout::UNDEFINED)
-            .final_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL),
-    ];
-    let color_refs = [vk::AttachmentReference::default()
-        .attachment(0)
-        .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)];
-    let depth_ref = vk::AttachmentReference::default()
-        .attachment(1)
-        .layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
-    let subpasses = [vk::SubpassDescription::default()
-        .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
-        .color_attachments(&color_refs)
-        .depth_stencil_attachment(&depth_ref)];
-    let attachment_stages = vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
-        | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
-        | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS;
-    let dependencies = [
-        vk::SubpassDependency::default()
-            .src_subpass(vk::SUBPASS_EXTERNAL)
-            .dst_subpass(0)
-            .src_stage_mask(attachment_stages)
-            .dst_stage_mask(attachment_stages)
-            .src_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE)
-            .dst_access_mask(
-                vk::AccessFlags::COLOR_ATTACHMENT_WRITE
-                    | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
-            ),
-        vk::SubpassDependency::default()
-            .src_subpass(0)
-            .dst_subpass(vk::SUBPASS_EXTERNAL)
-            .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
-            .dst_stage_mask(vk::PipelineStageFlags::TRANSFER)
-            .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
-            .dst_access_mask(vk::AccessFlags::TRANSFER_READ),
-    ];
-    let info = vk::RenderPassCreateInfo::default()
-        .attachments(&attachments)
-        .subpasses(&subpasses)
-        .dependencies(&dependencies);
-    Ok(unsafe { device.create_render_pass(&info, None)? })
-}
-
-fn create_framebuffers(
+/// One descriptor per binding, numbered from 0 in the order given.
+fn create_set_layout(
     device: &Device,
-    swapchain: &Swapchain,
-    render_pass: vk::RenderPass,
-) -> Result<Vec<vk::Framebuffer>> {
-    swapchain
-        .views
+    bindings: &[(vk::DescriptorType, vk::ShaderStageFlags)],
+) -> Result<vk::DescriptorSetLayout> {
+    let bindings: Vec<_> = bindings
         .iter()
-        .map(|&view| {
-            let attachments = [view, swapchain.depth.view];
-            let info = vk::FramebufferCreateInfo::default()
-                .render_pass(render_pass)
-                .attachments(&attachments)
-                .width(swapchain.extent.width)
-                .height(swapchain.extent.height)
-                .layers(1);
-            Ok(unsafe { device.create_framebuffer(&info, None)? })
+        .enumerate()
+        .map(|(index, &(kind, stages))| {
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(index as u32)
+                .descriptor_type(kind)
+                .descriptor_count(1)
+                .stage_flags(stages)
         })
-        .collect()
+        .collect();
+    let info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
+    Ok(unsafe { device.create_descriptor_set_layout(&info, None)? })
 }
 
-fn create_pipeline(
-    device: &Device,
-    layout: vk::PipelineLayout,
-    render_pass: Option<vk::RenderPass>,
-    color_format: vk::Format,
-) -> Result<vk::Pipeline> {
-    let vertex_module = create_shader_module(device, VERTEX_SPV)?;
-    let fragment_module = create_shader_module(device, FRAGMENT_SPV)?;
-    let stages = [
+fn create(device: &Device, desc: &Desc<'_>) -> Result<vk::Pipeline> {
+    let vertex_module = create_shader_module(device, desc.vertex)?;
+    let fragment_module = desc
+        .fragment
+        .map(|spv| create_shader_module(device, spv))
+        .transpose()?;
+    let mut stages = vec![
         vk::PipelineShaderStageCreateInfo::default()
             .stage(vk::ShaderStageFlags::VERTEX)
             .module(vertex_module)
             .name(c"main"),
-        vk::PipelineShaderStageCreateInfo::default()
-            .stage(vk::ShaderStageFlags::FRAGMENT)
-            .module(fragment_module)
-            .name(c"main"),
     ];
+    let constant_entries: Vec<_> = (0..desc.fragment_constants.len() as u32)
+        .map(|id| {
+            vk::SpecializationMapEntry::default()
+                .constant_id(id)
+                .offset(id * 4)
+                .size(4)
+        })
+        .collect();
+    let constant_data: Vec<u8> = desc
+        .fragment_constants
+        .iter()
+        .flat_map(|value| value.to_ne_bytes())
+        .collect();
+    let specialization = vk::SpecializationInfo::default()
+        .map_entries(&constant_entries)
+        .data(&constant_data);
+    if let Some(module) = fragment_module {
+        let mut stage = vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::FRAGMENT)
+            .module(module)
+            .name(c"main");
+        if !constant_entries.is_empty() {
+            stage = stage.specialization_info(&specialization);
+        }
+        stages.push(stage);
+    }
 
     let bindings = [vk::VertexInputBindingDescription::default()
         .binding(0)
         .stride(VERTEX_STRIDE)
         .input_rate(vk::VertexInputRate::VERTEX)];
-    let attributes = [
+    let attribute = |location: u32, format: vk::Format, offset: u32| {
         vk::VertexInputAttributeDescription::default()
-            .location(0)
-            .format(vk::Format::R32G32B32_SFLOAT)
-            .offset(0),
-        vk::VertexInputAttributeDescription::default()
-            .location(1)
-            .format(vk::Format::R32G32B32_SFLOAT)
-            .offset(12),
-    ];
-    let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
-        .vertex_binding_descriptions(&bindings)
+            .location(location)
+            .format(format)
+            .offset(offset)
+    };
+    let position = attribute(0, vk::Format::R32G32B32_SFLOAT, 0);
+    let normal = attribute(1, vk::Format::R32G32B32_SFLOAT, 12);
+    let color = attribute(2, vk::Format::R32G32B32A32_SFLOAT, 24);
+    let uv = attribute(3, vk::Format::R32G32_SFLOAT, 40);
+    let attributes: Vec<_> = match desc.input {
+        Input::Mesh => vec![position, normal, color, uv],
+        Input::Position => vec![position],
+        Input::PositionColor => vec![position, color],
+        Input::None => Vec::new(),
+    };
+    let mut vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
         .vertex_attribute_descriptions(&attributes);
+    if !attributes.is_empty() {
+        vertex_input = vertex_input.vertex_binding_descriptions(&bindings);
+    }
+
     let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
         .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
     let viewport = vk::PipelineViewportStateCreateInfo::default()
@@ -195,24 +354,49 @@ fn create_pipeline(
     let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
         .polygon_mode(vk::PolygonMode::FILL)
         .cull_mode(vk::CullModeFlags::NONE)
+        .depth_bias_enable(desc.depth_bias)
+        .depth_bias_constant_factor(1.25)
+        .depth_bias_slope_factor(1.75)
         .line_width(1.0);
     let multisample = vk::PipelineMultisampleStateCreateInfo::default()
         .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+    let (test, write, compare) = match desc.depth {
+        Depth::Off => (false, false, vk::CompareOp::ALWAYS),
+        Depth::Write => (true, true, vk::CompareOp::LESS),
+        Depth::ReadOnly(compare) => (true, false, compare),
+    };
     let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
-        .depth_test_enable(true)
-        .depth_write_enable(true)
-        .depth_compare_op(vk::CompareOp::LESS);
-    let blend_attachments = [vk::PipelineColorBlendAttachmentState::default()
-        .color_write_mask(vk::ColorComponentFlags::RGBA)];
+        .depth_test_enable(test)
+        .depth_write_enable(write)
+        .depth_compare_op(compare);
+
+    let blend_attachment = match desc.blend {
+        Blend::Opaque => vk::PipelineColorBlendAttachmentState::default(),
+        Blend::Alpha => vk::PipelineColorBlendAttachmentState::default()
+            .blend_enable(true)
+            .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
+            .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+            .color_blend_op(vk::BlendOp::ADD)
+            .src_alpha_blend_factor(vk::BlendFactor::ONE)
+            .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+            .alpha_blend_op(vk::BlendOp::ADD),
+    }
+    .color_write_mask(vk::ColorComponentFlags::RGBA);
+    let blend_attachments: Vec<_> = desc
+        .pass
+        .color_format()
+        .map(|_| blend_attachment)
+        .into_iter()
+        .collect();
     let color_blend =
         vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attachments);
     let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
     let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
 
-    let color_formats = [color_format];
+    let color_formats: Vec<_> = desc.pass.color_format().into_iter().collect();
     let mut rendering = vk::PipelineRenderingCreateInfo::default()
         .color_attachment_formats(&color_formats)
-        .depth_attachment_format(DEPTH_FORMAT);
+        .depth_attachment_format(desc.pass.depth_format().unwrap_or(vk::Format::UNDEFINED));
     let mut info = vk::GraphicsPipelineCreateInfo::default()
         .stages(&stages)
         .vertex_input_state(&vertex_input)
@@ -223,8 +407,8 @@ fn create_pipeline(
         .depth_stencil_state(&depth_stencil)
         .color_blend_state(&color_blend)
         .dynamic_state(&dynamic)
-        .layout(layout);
-    info = match render_pass {
+        .layout(desc.layout);
+    info = match desc.pass.render_pass() {
         Some(render_pass) => info.render_pass(render_pass).subpass(0),
         None => info.push_next(&mut rendering),
     };
@@ -233,7 +417,9 @@ fn create_pipeline(
         unsafe { device.create_graphics_pipelines(vk::PipelineCache::null(), &[info], None) };
     unsafe {
         device.destroy_shader_module(vertex_module, None);
-        device.destroy_shader_module(fragment_module, None);
+        if let Some(module) = fragment_module {
+            device.destroy_shader_module(module, None);
+        }
     }
     let pipelines = result.map_err(|(_, error)| error)?;
     Ok(pipelines[0])

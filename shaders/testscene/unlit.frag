@@ -1,9 +1,10 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
 
-layout(location = 0) flat in vec3 in_color;
+#include "mesh_in.glsl"
 
 layout(location = 0) out vec4 out_color;
 
 void main() {
-    out_color = vec4(in_color, 1.0);
+    out_color = in_color;
 }

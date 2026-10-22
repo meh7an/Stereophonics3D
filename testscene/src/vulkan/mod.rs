@@ -5,6 +5,7 @@
 
 mod context;
 mod memory;
+mod passes;
 mod pipeline;
 mod renderer;
 mod swapchain;

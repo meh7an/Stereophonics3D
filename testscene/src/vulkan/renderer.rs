@@ -1,17 +1,47 @@
 //! Frame recording, submission, presentation and swapchain readback.
+//!
+//! Each frame runs up to four passes: shadow (depth only, when the light casts shadows),
+//! main (to the swapchain, or to an HDR target when the scene post-processes), post
+//! (tone-map to the swapchain) and HUD (always, possibly empty, ending in present layout).
 
 use anyhow::{Result, bail};
 use ash::vk;
+use glam::{Mat4, Vec3};
 use winit::window::Window;
 
 use super::{
     RenderingMode,
     context::Context,
-    memory::{HostBuffer, subresource_range},
-    pipeline::{Pipeline, VERTEX_STRIDE},
-    swapchain::Swapchain,
+    memory::{DeviceImage, HostBuffer, subresource_range},
+    passes::{AttachmentSpec, Load, Pass, Target, layout_barrier},
+    pipeline::{Pipelines, VERTEX_STRIDE},
+    swapchain::{DEPTH_FORMAT, Swapchain},
 };
-use crate::scene::{CLEAR_COLOR, Scene};
+use crate::scene::{CLEAR_COLOR, Material, Scene, Vertex};
+
+const SHADOW_EXTENT: vk::Extent2D = vk::Extent2D {
+    width: 1024,
+    height: 1024,
+};
+const HDR_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
+const SHADOW_READ_LAYOUT: vk::ImageLayout = vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+/// Three `mat4` and three `vec4`, matching `Frame` in `frame.glsl` (std140).
+const UNIFORM_FLOATS: usize = 3 * 16 + 3 * 4;
+
+/// One mesh's slice of the shared vertex buffer.
+struct Draw {
+    material: Material,
+    model: Mat4,
+    first: u32,
+    count: u32,
+}
+
+/// Vertex ranges for one frame, in draw order.
+struct FrameDraws {
+    meshes: Vec<Draw>,
+    sky: Option<(u32, u32)>,
+    hud: (u32, u32),
+}
 
 /// Draws one scene, one frame in flight at a time.
 ///
@@ -19,21 +49,33 @@ use crate::scene::{CLEAR_COLOR, Scene};
 /// trivial and makes every frame's GPU work identical across runs.
 pub struct Renderer {
     mode: RenderingMode,
-    view_proj: [f32; 16],
-    vertex_count: u32,
+    uniform_buffer: HostBuffer,
     vertex_buffer: HostBuffer,
     capture_buffer: HostBuffer,
+    shadow_map: DeviceImage,
+    scene_color: Option<DeviceImage>,
+    shadow_sampler: vk::Sampler,
+    color_sampler: vk::Sampler,
+    descriptor_pool: vk::DescriptorPool,
+    frame_set: vk::DescriptorSet,
+    post_set: Option<vk::DescriptorSet>,
+    shadow_pass: Pass,
+    main_pass: Pass,
+    post_pass: Option<Pass>,
+    hud_pass: Pass,
+    pipelines: Pipelines,
     command_pool: vk::CommandPool,
     command_buffer: vk::CommandBuffer,
     image_available: vk::Semaphore,
     in_flight: vk::Fence,
-    pipeline: Pipeline,
     swapchain: Swapchain,
     // Last field: dropped after everything created from its device.
     ctx: Context,
 }
 
 impl Renderer {
+    /// Creates every resource `scene` needs. Later frames of the same scene must keep the
+    /// same post-processing setting and at most twice the vertex count.
     pub fn new(
         window: &Window,
         scene: &Scene,
@@ -43,61 +85,288 @@ impl Renderer {
     ) -> Result<Self> {
         let ctx = Context::new(window, validate)?;
         let swapchain = Swapchain::new(&ctx, extent)?;
-        let pipeline = Pipeline::new(&ctx.device, &swapchain, mode)?;
+        let device = &ctx.device;
 
-        let vertices = scene.vertices();
-        let bytes: Vec<u8> = vertices
-            .iter()
-            .flat_map(|vertex| vertex.position.to_array().into_iter().chain(vertex.color))
-            .flat_map(f32::to_ne_bytes)
-            .collect();
-        let vertex_buffer = HostBuffer::new(
+        let shadow_map = DeviceImage::new(
             &ctx,
-            bytes.len() as vk::DeviceSize,
-            vk::BufferUsageFlags::VERTEX_BUFFER,
+            SHADOW_EXTENT,
+            DEPTH_FORMAT,
+            vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
+                | vk::ImageUsageFlags::SAMPLED
+                | vk::ImageUsageFlags::TRANSFER_DST,
+            vk::ImageAspectFlags::DEPTH,
         )?;
-        vertex_buffer.write(&ctx.device, &bytes)?;
-        let vertex_count = u32::try_from(bytes.len())? / VERTEX_STRIDE;
+        let scene_color = scene
+            .post
+            .then(|| {
+                DeviceImage::new(
+                    &ctx,
+                    extent,
+                    HDR_FORMAT,
+                    vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+                    vk::ImageAspectFlags::COLOR,
+                )
+            })
+            .transpose()?;
 
+        let swapchain_targets: Vec<Target> = swapchain
+            .images
+            .iter()
+            .zip(&swapchain.views)
+            .map(|(&image, &view)| Target {
+                color: Some((image, view)),
+                depth: None,
+            })
+            .collect();
+        let depth_target = Some((swapchain.depth.image, swapchain.depth.view));
+
+        let shadow_pass = Pass::new(
+            device,
+            mode,
+            None,
+            Some(AttachmentSpec {
+                format: DEPTH_FORMAT,
+                load: Load::Clear(clear_depth()),
+                store: true,
+                initial: vk::ImageLayout::UNDEFINED,
+                final_layout: SHADOW_READ_LAYOUT,
+            }),
+            SHADOW_EXTENT,
+            &[shadow_target(&shadow_map)],
+        )?;
+        let main_targets: Vec<Target> = match &scene_color {
+            Some(color) => vec![Target {
+                color: Some((color.image, color.view)),
+                depth: depth_target,
+            }],
+            None => swapchain_targets
+                .iter()
+                .map(|target| Target {
+                    depth: depth_target,
+                    ..*target
+                })
+                .collect(),
+        };
+        let main_pass = Pass::new(
+            device,
+            mode,
+            Some(AttachmentSpec {
+                format: if scene.post {
+                    HDR_FORMAT
+                } else {
+                    swapchain.format
+                },
+                load: Load::Clear(clear_color()),
+                store: true,
+                initial: vk::ImageLayout::UNDEFINED,
+                final_layout: if scene.post {
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+                } else {
+                    vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
+                },
+            }),
+            Some(AttachmentSpec {
+                format: DEPTH_FORMAT,
+                load: Load::Clear(clear_depth()),
+                store: false,
+                initial: vk::ImageLayout::UNDEFINED,
+                final_layout: vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+            }),
+            extent,
+            &main_targets,
+        )?;
+        let post_pass = scene
+            .post
+            .then(|| {
+                Pass::new(
+                    device,
+                    mode,
+                    Some(AttachmentSpec {
+                        format: swapchain.format,
+                        load: Load::DontCare,
+                        store: true,
+                        initial: vk::ImageLayout::UNDEFINED,
+                        final_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                    }),
+                    None,
+                    extent,
+                    &swapchain_targets,
+                )
+            })
+            .transpose()?;
+        let hud_pass = Pass::new(
+            device,
+            mode,
+            Some(AttachmentSpec {
+                format: swapchain.format,
+                load: Load::Keep,
+                store: true,
+                initial: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                final_layout: vk::ImageLayout::PRESENT_SRC_KHR,
+            }),
+            None,
+            extent,
+            &swapchain_targets,
+        )?;
+        let pipelines = Pipelines::new(
+            device,
+            &shadow_pass,
+            &main_pass,
+            post_pass.as_ref(),
+            &hud_pass,
+        )?;
+
+        let shadow_sampler = unsafe {
+            device.create_sampler(
+                &vk::SamplerCreateInfo::default()
+                    .mag_filter(vk::Filter::NEAREST)
+                    .min_filter(vk::Filter::NEAREST)
+                    .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_BORDER)
+                    .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_BORDER)
+                    .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_BORDER)
+                    .border_color(vk::BorderColor::FLOAT_OPAQUE_WHITE)
+                    .compare_enable(true)
+                    .compare_op(vk::CompareOp::LESS_OR_EQUAL),
+                None,
+            )?
+        };
+        let color_sampler = unsafe {
+            device.create_sampler(
+                &vk::SamplerCreateInfo::default()
+                    .mag_filter(vk::Filter::NEAREST)
+                    .min_filter(vk::Filter::NEAREST)
+                    .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE),
+                None,
+            )?
+        };
+
+        let uniform_buffer = HostBuffer::new(
+            &ctx,
+            (UNIFORM_FLOATS * 4) as vk::DeviceSize,
+            vk::BufferUsageFlags::UNIFORM_BUFFER,
+        )?;
+        let vertex_capacity = 2 * vertex_count(scene) as u64 * u64::from(VERTEX_STRIDE);
+        let vertex_buffer =
+            HostBuffer::new(&ctx, vertex_capacity, vk::BufferUsageFlags::VERTEX_BUFFER)?;
         let capture_size = u64::from(extent.width) * u64::from(extent.height) * 4;
         let capture_buffer =
             HostBuffer::new(&ctx, capture_size, vk::BufferUsageFlags::TRANSFER_DST)?;
 
+        let pool_sizes = [
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::UNIFORM_BUFFER)
+                .descriptor_count(1),
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(2),
+        ];
+        let descriptor_pool = unsafe {
+            device.create_descriptor_pool(
+                &vk::DescriptorPoolCreateInfo::default()
+                    .max_sets(2)
+                    .pool_sizes(&pool_sizes),
+                None,
+            )?
+        };
+        let layouts = [pipelines.frame_set_layout, pipelines.post_set_layout];
+        let set_count = if scene.post { 2 } else { 1 };
+        let sets = unsafe {
+            device.allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(descriptor_pool)
+                    .set_layouts(&layouts[..set_count]),
+            )?
+        };
+        let frame_set = sets[0];
+        let post_set = sets.get(1).copied();
+
+        let buffer_info = [vk::DescriptorBufferInfo::default()
+            .buffer(uniform_buffer.buffer)
+            .range(vk::WHOLE_SIZE)];
+        let shadow_info = [vk::DescriptorImageInfo::default()
+            .sampler(shadow_sampler)
+            .image_view(shadow_map.view)
+            .image_layout(SHADOW_READ_LAYOUT)];
+        let mut writes = vec![
+            vk::WriteDescriptorSet::default()
+                .dst_set(frame_set)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                .buffer_info(&buffer_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(frame_set)
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&shadow_info),
+        ];
+        let color_info: Vec<_> = scene_color
+            .iter()
+            .map(|color| {
+                vk::DescriptorImageInfo::default()
+                    .sampler(color_sampler)
+                    .image_view(color.view)
+                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            })
+            .collect();
+        if let Some(post_set) = post_set {
+            writes.push(
+                vk::WriteDescriptorSet::default()
+                    .dst_set(post_set)
+                    .dst_binding(0)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(&color_info),
+            );
+        }
+        unsafe { device.update_descriptor_sets(&writes, &[]) };
+
         let pool_info = vk::CommandPoolCreateInfo::default()
             .queue_family_index(ctx.queue_family)
             .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
-        let command_pool = unsafe { ctx.device.create_command_pool(&pool_info, None)? };
+        let command_pool = unsafe { device.create_command_pool(&pool_info, None)? };
         let allocate_info = vk::CommandBufferAllocateInfo::default()
             .command_pool(command_pool)
             .level(vk::CommandBufferLevel::PRIMARY)
             .command_buffer_count(1);
-        let command_buffer = unsafe { ctx.device.allocate_command_buffers(&allocate_info)?[0] };
-        let image_available = unsafe {
-            ctx.device
-                .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)?
-        };
+        let command_buffer = unsafe { device.allocate_command_buffers(&allocate_info)?[0] };
+        let image_available =
+            unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None)? };
         let fence_info = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
-        let in_flight = unsafe { ctx.device.create_fence(&fence_info, None)? };
+        let in_flight = unsafe { device.create_fence(&fence_info, None)? };
 
-        Ok(Self {
+        let renderer = Self {
             mode,
-            view_proj: scene.view_proj().to_cols_array(),
-            vertex_count,
+            uniform_buffer,
             vertex_buffer,
             capture_buffer,
+            shadow_map,
+            scene_color,
+            shadow_sampler,
+            color_sampler,
+            descriptor_pool,
+            frame_set,
+            post_set,
+            shadow_pass,
+            main_pass,
+            post_pass,
+            hud_pass,
+            pipelines,
             command_pool,
             command_buffer,
             image_available,
             in_flight,
-            pipeline,
             swapchain,
             ctx,
-        })
+        };
+        renderer.initialize_shadow_map()?;
+        tracing::info!(mode = ?renderer.mode, post = scene.post, "renderer ready");
+        Ok(renderer)
     }
 
-    /// Renders and presents one frame. With `capture`, also returns the presented image
-    /// as tightly packed RGBA8 rows, top to bottom.
-    pub fn render(&mut self, capture: bool) -> Result<Option<Vec<u8>>> {
+    /// Renders and presents one frame of `scene`. With `capture`, also returns the
+    /// presented image as tightly packed RGBA8 rows, top to bottom.
+    pub fn render(&mut self, scene: &Scene, capture: bool) -> Result<Option<Vec<u8>>> {
         let device = &self.ctx.device;
         unsafe {
             device.wait_for_fences(&[self.in_flight], true, u64::MAX)?;
@@ -111,11 +380,15 @@ impl Renderer {
                 vk::Fence::null(),
             )?
         };
-        self.record(image_index as usize, capture)?;
+
+        self.uniform_buffer
+            .write(device, &floats_to_bytes(&uniforms(scene)))?;
+        let draws = self.upload_vertices(scene)?;
+        self.record(scene, &draws, image_index as usize, capture)?;
 
         let render_finished = self.swapchain.render_finished[image_index as usize];
         let wait_semaphores = [self.image_available];
-        let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+        let wait_stages = [vk::PipelineStageFlags::ALL_COMMANDS];
         let command_buffers = [self.command_buffer];
         let signal_semaphores = [render_finished];
         let submit = vk::SubmitInfo::default()
@@ -156,28 +429,82 @@ impl Renderer {
         }
     }
 
-    fn record(&self, image_index: usize, capture: bool) -> Result<()> {
+    /// Writes meshes, then the sky cube, then HUD triangles into the vertex buffer.
+    fn upload_vertices(&self, scene: &Scene) -> Result<FrameDraws> {
+        let mut vertices: Vec<Vertex> = Vec::with_capacity(vertex_count(scene));
+        let mut range = |new: &[Vertex]| -> Result<(u32, u32)> {
+            let first = u32::try_from(vertices.len())?;
+            vertices.extend_from_slice(new);
+            Ok((first, u32::try_from(new.len())?))
+        };
+        let mut meshes = Vec::with_capacity(scene.meshes.len());
+        for mesh in &scene.meshes {
+            let (first, count) = range(&mesh.vertices)?;
+            meshes.push(Draw {
+                material: mesh.material,
+                model: mesh.model,
+                first,
+                count,
+            });
+        }
+        let sky = if scene.sky {
+            Some(range(&scene.sky_vertices())?)
+        } else {
+            None
+        };
+        let hud = range(&scene.hud)?;
+
+        let floats: Vec<f32> = vertices
+            .iter()
+            .flat_map(|v| {
+                v.position
+                    .to_array()
+                    .into_iter()
+                    .chain(v.normal.to_array())
+                    .chain(v.color)
+                    .chain(v.uv)
+            })
+            .collect();
+        let bytes = floats_to_bytes(&floats);
+        if bytes.len() as u64 > self.vertex_buffer.size {
+            bail!(
+                "frame needs {} vertex bytes, buffer holds {}",
+                bytes.len(),
+                self.vertex_buffer.size
+            );
+        }
+        self.vertex_buffer.write(&self.ctx.device, &bytes)?;
+        Ok(FrameDraws { meshes, sky, hud })
+    }
+
+    fn record(
+        &self,
+        scene: &Scene,
+        draws: &FrameDraws,
+        image_index: usize,
+        capture: bool,
+    ) -> Result<()> {
         let device = &self.ctx.device;
         let cmd = self.command_buffer;
-        let image = self.swapchain.images[image_index];
-        let extent = self.swapchain.extent;
-        let clear_color = vk::ClearValue {
-            color: vk::ClearColorValue {
-                float32: [
-                    f32::from(CLEAR_COLOR[0]) / 255.0,
-                    f32::from(CLEAR_COLOR[1]) / 255.0,
-                    f32::from(CLEAR_COLOR[2]) / 255.0,
-                    1.0,
-                ],
-            },
+        let pipelines = &self.pipelines;
+        let swapchain_image = self.swapchain.images[image_index];
+        let swapchain_target = Target {
+            color: Some((swapchain_image, self.swapchain.views[image_index])),
+            depth: None,
         };
-        let clear_depth = vk::ClearValue {
-            depth_stencil: vk::ClearDepthStencilValue {
-                depth: 1.0,
-                stencil: 0,
-            },
+        let depth = Some((self.swapchain.depth.image, self.swapchain.depth.view));
+        let opaque = || {
+            draws
+                .meshes
+                .iter()
+                .filter(|d| d.material != Material::Transparent)
         };
-        let render_area = vk::Rect2D::default().extent(extent);
+        let transparent = || {
+            draws
+                .meshes
+                .iter()
+                .filter(|d| d.material == Material::Transparent)
+        };
 
         unsafe {
             device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
@@ -186,160 +513,129 @@ impl Renderer {
                 &vk::CommandBufferBeginInfo::default()
                     .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
             )?;
-
-            match self.mode {
-                RenderingMode::Pass => {
-                    let clears = [clear_color, clear_depth];
-                    // `Pipeline::new` always creates a render pass in pass mode.
-                    let render_pass = self.pipeline.render_pass.expect("pass mode has one");
-                    let begin = vk::RenderPassBeginInfo::default()
-                        .render_pass(render_pass)
-                        .framebuffer(self.pipeline.framebuffers[image_index])
-                        .render_area(render_area)
-                        .clear_values(&clears);
-                    device.cmd_begin_render_pass(cmd, &begin, vk::SubpassContents::INLINE);
-                }
-                RenderingMode::Dynamic => {
-                    self.begin_dynamic_rendering(image_index, clear_color, clear_depth);
-                }
-            }
-
-            let viewport = vk::Viewport::default()
-                .width(extent.width as f32)
-                .height(extent.height as f32)
-                .max_depth(1.0);
-            device.cmd_set_viewport(cmd, 0, &[viewport]);
-            device.cmd_set_scissor(cmd, 0, &[render_area]);
-            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline.handle);
-            let push: Vec<u8> = self
-                .view_proj
-                .iter()
-                .flat_map(|v| v.to_ne_bytes())
-                .collect();
-            device.cmd_push_constants(
+            device.cmd_bind_vertex_buffers(cmd, 0, &[self.vertex_buffer.buffer], &[0]);
+            device.cmd_bind_descriptor_sets(
                 cmd,
-                self.pipeline.layout,
+                vk::PipelineBindPoint::GRAPHICS,
+                pipelines.mesh_layout,
+                0,
+                &[self.frame_set],
+                &[],
+            );
+        }
+
+        if scene.light_view_proj().is_some() {
+            let target = shadow_target(&self.shadow_map);
+            self.shadow_pass.begin(device, cmd, 0, &target);
+            self.bind(pipelines.shadow);
+            opaque().for_each(|draw| self.draw_mesh(draw));
+            self.shadow_pass.end(device, cmd, &target);
+        }
+
+        let (main_index, main_target) = match &self.scene_color {
+            Some(color) => (
+                0,
+                Target {
+                    color: Some((color.image, color.view)),
+                    depth,
+                },
+            ),
+            None => (
+                image_index,
+                Target {
+                    depth,
+                    ..swapchain_target
+                },
+            ),
+        };
+        self.main_pass.begin(device, cmd, main_index, &main_target);
+        for draw in opaque() {
+            self.bind(pipelines.for_material(draw.material));
+            self.draw_mesh(draw);
+        }
+        if let Some((first, count)) = draws.sky {
+            self.bind(pipelines.sky);
+            unsafe { device.cmd_draw(cmd, count, 1, first, 0) };
+        }
+        for draw in transparent() {
+            self.bind(pipelines.transparent);
+            self.draw_mesh(draw);
+        }
+        self.main_pass.end(device, cmd, &main_target);
+
+        if let (Some(post_pass), Some(tonemap), Some(post_set)) =
+            (&self.post_pass, pipelines.tonemap, self.post_set)
+        {
+            post_pass.begin(device, cmd, image_index, &swapchain_target);
+            self.bind(tonemap);
+            unsafe {
+                device.cmd_bind_descriptor_sets(
+                    cmd,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    pipelines.post_layout,
+                    0,
+                    &[post_set],
+                    &[],
+                );
+                device.cmd_draw(cmd, 3, 1, 0, 0);
+            }
+            post_pass.end(device, cmd, &swapchain_target);
+        }
+
+        self.hud_pass
+            .begin(device, cmd, image_index, &swapchain_target);
+        let (first, count) = draws.hud;
+        if count > 0 {
+            self.bind(pipelines.hud);
+            unsafe { device.cmd_draw(cmd, count, 1, first, 0) };
+        }
+        self.hud_pass.end(device, cmd, &swapchain_target);
+
+        if capture {
+            self.copy_to_capture(swapchain_image);
+        }
+        unsafe { device.end_command_buffer(cmd)? };
+        Ok(())
+    }
+
+    fn bind(&self, pipeline: vk::Pipeline) {
+        unsafe {
+            self.ctx.device.cmd_bind_pipeline(
+                self.command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                pipeline,
+            );
+        }
+    }
+
+    fn draw_mesh(&self, draw: &Draw) {
+        let push = floats_to_bytes(&draw.model.to_cols_array());
+        unsafe {
+            self.ctx.device.cmd_push_constants(
+                self.command_buffer,
+                self.pipelines.mesh_layout,
                 vk::ShaderStageFlags::VERTEX,
                 0,
                 &push,
             );
-            device.cmd_bind_vertex_buffers(cmd, 0, &[self.vertex_buffer.buffer], &[0]);
-            device.cmd_draw(cmd, self.vertex_count, 1, 0, 0);
-
-            // Both paths leave the image in PRESENT_SRC_KHR with colour writes made
-            // available to transfer, which is what `copy_to_capture` expects.
-            match self.mode {
-                RenderingMode::Pass => device.cmd_end_render_pass(cmd),
-                RenderingMode::Dynamic => {
-                    device.cmd_end_rendering(cmd);
-                    image_barrier(
-                        device,
-                        cmd,
-                        image,
-                        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                        vk::ImageLayout::PRESENT_SRC_KHR,
-                        (
-                            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-                            vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
-                        ),
-                        (
-                            vk::PipelineStageFlags::TRANSFER,
-                            vk::AccessFlags::TRANSFER_READ,
-                        ),
-                    );
-                }
-            }
-            if capture {
-                self.copy_to_capture(image);
-            }
-            device.end_command_buffer(cmd)?;
+            self.ctx
+                .device
+                .cmd_draw(self.command_buffer, draw.count, 1, draw.first, 0);
         }
-        Ok(())
-    }
-
-    /// Transitions the colour and depth targets and opens a dynamic rendering scope.
-    fn begin_dynamic_rendering(
-        &self,
-        image_index: usize,
-        clear_color: vk::ClearValue,
-        clear_depth: vk::ClearValue,
-    ) {
-        let device = &self.ctx.device;
-        let cmd = self.command_buffer;
-        image_barrier(
-            device,
-            cmd,
-            self.swapchain.images[image_index],
-            vk::ImageLayout::UNDEFINED,
-            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-            (
-                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-                vk::AccessFlags::NONE,
-            ),
-            (
-                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-                vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
-            ),
-        );
-        let depth_stages = vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
-            | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS;
-        let depth_barrier = vk::ImageMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE)
-            .dst_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE)
-            .old_layout(vk::ImageLayout::UNDEFINED)
-            .new_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .image(self.swapchain.depth.image)
-            .subresource_range(subresource_range(vk::ImageAspectFlags::DEPTH));
-        unsafe {
-            device.cmd_pipeline_barrier(
-                cmd,
-                depth_stages,
-                depth_stages,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[depth_barrier],
-            );
-        }
-
-        let color_attachments = [vk::RenderingAttachmentInfo::default()
-            .image_view(self.swapchain.views[image_index])
-            .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-            .load_op(vk::AttachmentLoadOp::CLEAR)
-            .store_op(vk::AttachmentStoreOp::STORE)
-            .clear_value(clear_color)];
-        let depth_attachment = vk::RenderingAttachmentInfo::default()
-            .image_view(self.swapchain.depth.view)
-            .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
-            .load_op(vk::AttachmentLoadOp::CLEAR)
-            .store_op(vk::AttachmentStoreOp::DONT_CARE)
-            .clear_value(clear_depth);
-        let rendering = vk::RenderingInfo::default()
-            .render_area(vk::Rect2D::default().extent(self.swapchain.extent))
-            .layer_count(1)
-            .color_attachments(&color_attachments)
-            .depth_attachment(&depth_attachment);
-        unsafe { device.cmd_begin_rendering(cmd, &rendering) };
     }
 
     /// Copies the presentable image into `capture_buffer` and returns it to
-    /// `PRESENT_SRC_KHR`. Expects prior colour writes to be visible to transfer.
+    /// `PRESENT_SRC_KHR`.
     fn copy_to_capture(&self, image: vk::Image) {
         let device = &self.ctx.device;
         let cmd = self.command_buffer;
-        image_barrier(
+        layout_barrier(
             device,
             cmd,
             image,
+            vk::ImageAspectFlags::COLOR,
             vk::ImageLayout::PRESENT_SRC_KHR,
             vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-            (vk::PipelineStageFlags::TRANSFER, vk::AccessFlags::NONE),
-            (
-                vk::PipelineStageFlags::TRANSFER,
-                vk::AccessFlags::TRANSFER_READ,
-            ),
         );
         let region = vk::BufferImageCopy::default()
             .image_subresource(
@@ -373,21 +669,66 @@ impl Renderer {
                 &[],
             );
         }
-        image_barrier(
+        layout_barrier(
             device,
             cmd,
             image,
+            vk::ImageAspectFlags::COLOR,
             vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
             vk::ImageLayout::PRESENT_SRC_KHR,
-            (
-                vk::PipelineStageFlags::TRANSFER,
-                vk::AccessFlags::TRANSFER_READ,
-            ),
-            (
-                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                vk::AccessFlags::NONE,
-            ),
         );
+    }
+
+    /// Clears the shadow map to the far plane and leaves it in its sampled layout, so lit
+    /// scenes without a shadow pass still bind a valid image.
+    fn initialize_shadow_map(&self) -> Result<()> {
+        let device = &self.ctx.device;
+        let cmd = self.command_buffer;
+        let image = self.shadow_map.image;
+        let range = subresource_range(vk::ImageAspectFlags::DEPTH);
+        unsafe {
+            device.begin_command_buffer(
+                cmd,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )?;
+        }
+        layout_barrier(
+            device,
+            cmd,
+            image,
+            vk::ImageAspectFlags::DEPTH,
+            vk::ImageLayout::UNDEFINED,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        );
+        unsafe {
+            device.cmd_clear_depth_stencil_image(
+                cmd,
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &vk::ClearDepthStencilValue {
+                    depth: 1.0,
+                    stencil: 0,
+                },
+                &[range],
+            );
+        }
+        layout_barrier(
+            device,
+            cmd,
+            image,
+            vk::ImageAspectFlags::DEPTH,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            SHADOW_READ_LAYOUT,
+        );
+        unsafe {
+            device.end_command_buffer(cmd)?;
+            let command_buffers = [cmd];
+            let submit = vk::SubmitInfo::default().command_buffers(&command_buffers);
+            device.queue_submit(self.ctx.queue, &[submit], vk::Fence::null())?;
+            device.queue_wait_idle(self.ctx.queue)?;
+        }
+        Ok(())
     }
 }
 
@@ -401,42 +742,83 @@ impl Drop for Renderer {
             device.destroy_fence(self.in_flight, None);
             device.destroy_semaphore(self.image_available, None);
             device.destroy_command_pool(self.command_pool, None);
+            device.destroy_descriptor_pool(self.descriptor_pool, None);
+            device.destroy_sampler(self.shadow_sampler, None);
+            device.destroy_sampler(self.color_sampler, None);
         }
+        self.pipelines.destroy(device);
+        self.hud_pass.destroy(device);
+        if let Some(pass) = &self.post_pass {
+            pass.destroy(device);
+        }
+        self.main_pass.destroy(device);
+        self.shadow_pass.destroy(device);
+        if let Some(color) = &self.scene_color {
+            color.destroy(device);
+        }
+        self.shadow_map.destroy(device);
         self.capture_buffer.destroy(device);
         self.vertex_buffer.destroy(device);
-        self.pipeline.destroy(device);
+        self.uniform_buffer.destroy(device);
         self.swapchain.destroy(&self.ctx);
     }
 }
 
-/// Records a single colour-image layout transition.
-fn image_barrier(
-    device: &ash::Device,
-    cmd: vk::CommandBuffer,
-    image: vk::Image,
-    old_layout: vk::ImageLayout,
-    new_layout: vk::ImageLayout,
-    (src_stage, src_access): (vk::PipelineStageFlags, vk::AccessFlags),
-    (dst_stage, dst_access): (vk::PipelineStageFlags, vk::AccessFlags),
-) {
-    let barrier = vk::ImageMemoryBarrier::default()
-        .src_access_mask(src_access)
-        .dst_access_mask(dst_access)
-        .old_layout(old_layout)
-        .new_layout(new_layout)
-        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .image(image)
-        .subresource_range(subresource_range(vk::ImageAspectFlags::COLOR));
-    unsafe {
-        device.cmd_pipeline_barrier(
-            cmd,
-            src_stage,
-            dst_stage,
-            vk::DependencyFlags::empty(),
-            &[],
-            &[],
-            &[barrier],
-        );
+fn shadow_target(shadow_map: &DeviceImage) -> Target {
+    Target {
+        color: None,
+        depth: Some((shadow_map.image, shadow_map.view)),
     }
+}
+
+fn clear_color() -> vk::ClearValue {
+    let [r, g, b] = CLEAR_COLOR.map(|channel| f32::from(channel) / 255.0);
+    vk::ClearValue {
+        color: vk::ClearColorValue {
+            float32: [r, g, b, 1.0],
+        },
+    }
+}
+
+fn clear_depth() -> vk::ClearValue {
+    vk::ClearValue {
+        depth_stencil: vk::ClearDepthStencilValue {
+            depth: 1.0,
+            stencil: 0,
+        },
+    }
+}
+
+fn vertex_count(scene: &Scene) -> usize {
+    let sky = if scene.sky {
+        scene.sky_vertices().len()
+    } else {
+        0
+    };
+    scene.meshes.iter().map(|m| m.vertices.len()).sum::<usize>() + sky + scene.hud.len()
+}
+
+/// The `Frame` uniform block for `scene`, in std140 order.
+fn uniforms(scene: &Scene) -> Vec<f32> {
+    let light_view_proj = scene.light_view_proj();
+    let (direction, color, ambient) = match scene.light {
+        Some(light) => (light.direction, light.color, light.ambient),
+        None => (Vec3::Y, Vec3::ZERO, 1.0),
+    };
+    let shadowed = if light_view_proj.is_some() { 1.0 } else { 0.0 };
+    let mut floats = Vec::with_capacity(UNIFORM_FLOATS);
+    floats.extend(scene.view_proj().to_cols_array());
+    floats.extend(scene.sky_view_proj().to_cols_array());
+    floats.extend(light_view_proj.unwrap_or(Mat4::IDENTITY).to_cols_array());
+    floats.extend(scene.camera.position.extend(1.0).to_array());
+    floats.extend(direction.extend(shadowed).to_array());
+    floats.extend(color.extend(ambient).to_array());
+    floats
+}
+
+fn floats_to_bytes(floats: &[f32]) -> Vec<u8> {
+    floats
+        .iter()
+        .flat_map(|value| value.to_ne_bytes())
+        .collect()
 }

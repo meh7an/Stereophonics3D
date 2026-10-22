@@ -2,7 +2,23 @@
 
 use std::{env, path::PathBuf, process::Command};
 
-const SHADERS: &[&str] = &["unlit.vert", "unlit.frag"];
+const SHADERS: &[&str] = &[
+    "mesh.vert",
+    "shadow.vert",
+    "sky.vert",
+    "hud.vert",
+    "fullscreen.vert",
+    "unlit.frag",
+    "pattern.frag",
+    "lit.frag",
+    "reflect.frag",
+    "sky.frag",
+    "hud.frag",
+    "tonemap.frag",
+];
+
+/// Included by the shaders above; listed so editing one triggers a rebuild.
+const INCLUDES: &[&str] = &["frame.glsl", "mesh_in.glsl", "env.glsl"];
 
 fn main() {
     let sdk = env::var_os("VULKAN_SDK")
@@ -15,6 +31,12 @@ fn main() {
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("set by cargo"));
 
     println!("cargo:rerun-if-env-changed=VULKAN_SDK");
+    for include in INCLUDES {
+        println!(
+            "cargo:rerun-if-changed={}",
+            source_dir.join(include).display()
+        );
+    }
     for shader in SHADERS {
         let source = source_dir.join(shader);
         println!("cargo:rerun-if-changed={}", source.display());

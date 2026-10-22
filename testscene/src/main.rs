@@ -5,6 +5,7 @@
 //! of by eye.
 
 mod capture;
+mod probe;
 mod scene;
 mod vulkan;
 
@@ -51,6 +52,10 @@ struct Args {
     /// Enable the Khronos validation layer; any validation error fails the run.
     #[arg(long)]
     validate: bool,
+
+    /// Read the frame counter back from the last frame's pixels and fail on a mismatch.
+    #[arg(long)]
+    self_check: bool,
 }
 
 fn main() -> Result<()> {
@@ -67,7 +72,6 @@ fn main() -> Result<()> {
 /// Window, renderer and frame counter, driven by winit's event loop.
 struct App {
     args: Args,
-    scene: Scene,
     frame: u32,
     // Declared before `window`: the surface must be destroyed before its window.
     renderer: Option<Renderer>,
@@ -77,10 +81,8 @@ struct App {
 
 impl App {
     fn new(args: Args) -> Self {
-        let scene = Scene::build(args.scene, WIDTH as f32 / HEIGHT as f32);
         Self {
             args,
-            scene,
             frame: 0,
             renderer: None,
             window: None,
@@ -100,7 +102,7 @@ impl App {
         };
         let renderer = Renderer::new(
             &window,
-            &self.scene,
+            &self.scene(0),
             extent,
             self.args.rendering,
             self.args.validate,
@@ -111,25 +113,28 @@ impl App {
         Ok(())
     }
 
+    fn scene(&self, frame: u32) -> Scene {
+        Scene::build(self.args.scene, WIDTH as f32 / HEIGHT as f32, frame)
+    }
+
     /// Renders one frame and reports whether the run is complete.
     fn step(&mut self) -> Result<bool> {
+        let scene = self.scene(self.frame);
         let Some(renderer) = self.renderer.as_mut() else {
             return Ok(false);
         };
         let last = self.frame + 1 == self.args.frames;
-        let capture_dir = self.args.capture.as_deref().filter(|_| last);
-        if let Some(rgba) = renderer.render(capture_dir.is_some())?
-            && let Some(dir) = capture_dir
-        {
-            let sidecar = capture::Sidecar::new(
-                &self.scene,
-                self.frame,
-                (WIDTH, HEIGHT),
-                self.args.rendering,
-            );
-            let path = capture::write(dir, &rgba, &sidecar)?;
-            tracing::info!(path = %path.display(), "captured frame");
-            println!("captured {}", path.display());
+        let needs_pixels = last && (self.args.capture.is_some() || self.args.self_check);
+        if let Some(rgba) = renderer.render(&scene, needs_pixels)? {
+            if let Some(dir) = &self.args.capture {
+                let sidecar = capture::Sidecar::new(&scene, (WIDTH, HEIGHT), self.args.rendering);
+                let path = capture::write(dir, &rgba, &sidecar)?;
+                tracing::info!(path = %path.display(), "captured frame");
+                println!("captured {}", path.display());
+            }
+            if self.args.self_check {
+                self_check(&scene, &rgba)?;
+            }
         }
         self.frame += 1;
         Ok(last)
@@ -160,6 +165,23 @@ impl App {
         tracing::info!(frames = self.frame, "finished");
         Ok(())
     }
+}
+
+/// Fails unless the counter decoded from `rgba` equals the scene's counter.
+fn self_check(scene: &Scene, rgba: &[u8]) -> Result<()> {
+    let Some(expected) = scene.counter else {
+        println!("self-check: scene {} has no counter", scene.id.name());
+        return Ok(());
+    };
+    let decoded = probe::decode_counter(rgba, WIDTH, HEIGHT, &scene.probes)?;
+    if decoded != expected {
+        bail!("self-check: counter reads {decoded}, frame encodes {expected}");
+    }
+    println!(
+        "self-check: counter {decoded} matches frame {}",
+        scene.frame
+    );
+    Ok(())
 }
 
 impl ApplicationHandler for App {
