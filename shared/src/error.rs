@@ -16,6 +16,14 @@ pub enum Error {
     #[error("LOCALAPPDATA is not set; no default log directory")]
     NoLocalAppData,
 
+    /// `%APPDATA%` is unset, so there is no default configuration directory.
+    #[error("APPDATA is not set; no default configuration directory")]
+    NoAppData,
+
+    /// The configuration directory could not be watched for changes.
+    #[error("cannot watch the configuration directory")]
+    Watch(#[from] notify::Error),
+
     /// The log directory could not be created.
     #[error("failed to create log directory {dir}")]
     LogDir {
