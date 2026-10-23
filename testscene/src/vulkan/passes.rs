@@ -151,6 +151,31 @@ impl Pass {
         }
     }
 
+    /// Points the pass at new targets of a new extent, recreating the framebuffers in pass
+    /// mode. The render pass stays, so pipelines built against it remain valid.
+    pub fn retarget(
+        &mut self,
+        device: &Device,
+        extent: vk::Extent2D,
+        targets: &[Target],
+    ) -> Result<()> {
+        self.destroy_framebuffers(device);
+        self.extent = extent;
+        if let Some(render_pass) = self.render_pass {
+            for target in targets {
+                let framebuffer = create_framebuffer(device, render_pass, target, extent)?;
+                self.framebuffers.push(framebuffer);
+            }
+        }
+        Ok(())
+    }
+
+    fn destroy_framebuffers(&mut self, device: &Device) {
+        for framebuffer in self.framebuffers.drain(..) {
+            unsafe { device.destroy_framebuffer(framebuffer, None) };
+        }
+    }
+
     pub fn destroy(&self, device: &Device) {
         unsafe {
             for &framebuffer in &self.framebuffers {

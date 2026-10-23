@@ -26,7 +26,8 @@ pub struct Swapchain {
 }
 
 impl Swapchain {
-    pub fn new(ctx: &Context, requested: vk::Extent2D) -> Result<Self> {
+    /// Creates the swapchain at `requested` size, replacing `old` (or null) if given.
+    pub fn new(ctx: &Context, requested: vk::Extent2D, old: vk::SwapchainKHR) -> Result<Self> {
         let caps = unsafe {
             ctx.surface_loader
                 .get_physical_device_surface_capabilities(ctx.physical_device, ctx.surface)?
@@ -86,7 +87,8 @@ impl Swapchain {
             .pre_transform(caps.current_transform)
             .composite_alpha(composite_alpha)
             .present_mode(vk::PresentModeKHR::FIFO)
-            .clipped(true);
+            .clipped(true)
+            .old_swapchain(old);
         let handle = unsafe { ctx.swapchain_loader.create_swapchain(&info, None)? };
         let images = unsafe { ctx.swapchain_loader.get_swapchain_images(handle)? };
 

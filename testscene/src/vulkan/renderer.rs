@@ -94,7 +94,7 @@ impl Renderer {
         validate: bool,
     ) -> Result<Self> {
         let ctx = Context::new(window, validate)?;
-        let swapchain = Swapchain::new(&ctx, extent)?;
+        let swapchain = Swapchain::new(&ctx, extent, vk::SwapchainKHR::null())?;
         let device = &ctx.device;
 
         let shadow_map = DeviceImage::new(
@@ -108,27 +108,9 @@ impl Renderer {
         )?;
         let scene_color = scene
             .post
-            .then(|| {
-                DeviceImage::new(
-                    &ctx,
-                    extent,
-                    HDR_FORMAT,
-                    vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
-                    vk::ImageAspectFlags::COLOR,
-                )
-            })
+            .then(|| create_scene_color(&ctx, extent))
             .transpose()?;
-
-        let swapchain_targets: Vec<Target> = swapchain
-            .images
-            .iter()
-            .zip(&swapchain.views)
-            .map(|(&image, &view)| Target {
-                color: Some((image, view)),
-                depth: None,
-            })
-            .collect();
-        let depth_target = Some((swapchain.depth.image, swapchain.depth.view));
+        let swapchain_targets = swapchain_targets(&swapchain);
 
         let shadow_pass = Pass::new(
             device,
@@ -144,19 +126,7 @@ impl Renderer {
             SHADOW_EXTENT,
             &[shadow_target(&shadow_map)],
         )?;
-        let main_targets: Vec<Target> = match &scene_color {
-            Some(color) => vec![Target {
-                color: Some((color.image, color.view)),
-                depth: depth_target,
-            }],
-            None => swapchain_targets
-                .iter()
-                .map(|target| Target {
-                    depth: depth_target,
-                    ..*target
-                })
-                .collect(),
-        };
+        let main_targets = main_targets(&swapchain, scene_color.as_ref());
         let main_pass = Pass::new(
             device,
             mode,
@@ -301,7 +271,7 @@ impl Renderer {
             .sampler(shadow_sampler)
             .image_view(shadow_map.view)
             .image_layout(SHADOW_READ_LAYOUT)];
-        let mut writes = vec![
+        let writes = [
             vk::WriteDescriptorSet::default()
                 .dst_set(frame_set)
                 .dst_binding(0)
@@ -313,25 +283,10 @@ impl Renderer {
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .image_info(&shadow_info),
         ];
-        let color_info: Vec<_> = scene_color
-            .iter()
-            .map(|color| {
-                vk::DescriptorImageInfo::default()
-                    .sampler(color_sampler)
-                    .image_view(color.view)
-                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-            })
-            .collect();
-        if let Some(post_set) = post_set {
-            writes.push(
-                vk::WriteDescriptorSet::default()
-                    .dst_set(post_set)
-                    .dst_binding(0)
-                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                    .image_info(&color_info),
-            );
-        }
         unsafe { device.update_descriptor_sets(&writes, &[]) };
+        if let (Some(post_set), Some(color)) = (post_set, &scene_color) {
+            write_post_set(device, post_set, color_sampler, color);
+        }
 
         let pool_info = vk::CommandPoolCreateInfo::default()
             .queue_family_index(ctx.queue_family)
@@ -375,6 +330,41 @@ impl Renderer {
         renderer.initialize_shadow_map()?;
         tracing::info!(mode = ?renderer.mode, post = scene.post, "renderer ready");
         Ok(renderer)
+    }
+
+    /// Recreates the swapchain (retiring the old one) and everything sized by it at
+    /// `extent`, after the GPU has gone idle.
+    pub fn resize(&mut self, extent: vk::Extent2D) -> Result<()> {
+        let device = &self.ctx.device;
+        unsafe { device.device_wait_idle()? };
+        let swapchain = Swapchain::new(&self.ctx, extent, self.swapchain.handle)?;
+        let old = std::mem::replace(&mut self.swapchain, swapchain);
+        old.destroy(&self.ctx);
+
+        if let Some(color) = self.scene_color.take() {
+            color.destroy(device);
+            self.scene_color = Some(create_scene_color(&self.ctx, extent)?);
+        }
+        let swapchain_targets = swapchain_targets(&self.swapchain);
+        let main_targets = main_targets(&self.swapchain, self.scene_color.as_ref());
+        self.main_pass.retarget(device, extent, &main_targets)?;
+        if let Some(post_pass) = &mut self.post_pass {
+            post_pass.retarget(device, extent, &swapchain_targets)?;
+        }
+        self.hud_pass.retarget(device, extent, &swapchain_targets)?;
+        if let (Some(post_set), Some(color)) = (self.post_set, &self.scene_color) {
+            write_post_set(device, post_set, self.color_sampler, color);
+        }
+
+        let capture_size = u64::from(extent.width) * u64::from(extent.height) * 4;
+        self.capture_buffer.destroy(device);
+        self.capture_buffer =
+            HostBuffer::new(&self.ctx, capture_size, vk::BufferUsageFlags::TRANSFER_DST)?;
+        self.depth_buffer.destroy(device);
+        self.depth_buffer =
+            HostBuffer::new(&self.ctx, capture_size, vk::BufferUsageFlags::TRANSFER_DST)?;
+        tracing::info!(width = extent.width, height = extent.height, "resized");
+        Ok(())
     }
 
     /// See [`Context::print_device_report`].
@@ -843,6 +833,65 @@ impl Drop for Renderer {
         self.uniform_buffer.destroy(device);
         self.swapchain.destroy(&self.ctx);
     }
+}
+
+/// The HDR target the main pass renders into when the scene post-processes.
+fn create_scene_color(ctx: &Context, extent: vk::Extent2D) -> Result<DeviceImage> {
+    DeviceImage::new(
+        ctx,
+        extent,
+        HDR_FORMAT,
+        vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+        vk::ImageAspectFlags::COLOR,
+    )
+}
+
+/// One colour-only target per swapchain image.
+fn swapchain_targets(swapchain: &Swapchain) -> Vec<Target> {
+    swapchain
+        .images
+        .iter()
+        .zip(&swapchain.views)
+        .map(|(&image, &view)| Target {
+            color: Some((image, view)),
+            depth: None,
+        })
+        .collect()
+}
+
+/// The main pass's targets: the HDR colour target when present, else every swapchain
+/// image; always with the swapchain's depth buffer.
+fn main_targets(swapchain: &Swapchain, scene_color: Option<&DeviceImage>) -> Vec<Target> {
+    let depth = Some((swapchain.depth.image, swapchain.depth.view));
+    match scene_color {
+        Some(color) => vec![Target {
+            color: Some((color.image, color.view)),
+            depth,
+        }],
+        None => swapchain_targets(swapchain)
+            .into_iter()
+            .map(|target| Target { depth, ..target })
+            .collect(),
+    }
+}
+
+/// Points the tone-map pass's descriptor at `color`.
+fn write_post_set(
+    device: &ash::Device,
+    post_set: vk::DescriptorSet,
+    sampler: vk::Sampler,
+    color: &DeviceImage,
+) {
+    let info = [vk::DescriptorImageInfo::default()
+        .sampler(sampler)
+        .image_view(color.view)
+        .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+    let write = vk::WriteDescriptorSet::default()
+        .dst_set(post_set)
+        .dst_binding(0)
+        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+        .image_info(&info);
+    unsafe { device.update_descriptor_sets(&[write], &[]) };
 }
 
 fn shadow_target(shadow_map: &DeviceImage) -> Target {

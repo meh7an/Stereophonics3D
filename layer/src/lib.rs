@@ -4,7 +4,9 @@
 //! data, and stays pure pass-through unless a profile opts the process in (and no
 //! anti-cheat module is loaded). Active processes get their shader modules, pipelines and
 //! command buffers tracked, interception-defeating extensions hidden, shaders optionally
-//! dumped, and draws of profile-skipped shaders dropped.
+//! dumped, and draws of profile-skipped shaders dropped. Their swapchains are virtualised:
+//! the application renders into layer-owned images that a compositor draws into the real
+//! swapchain at present.
 
 #[macro_use]
 mod macros;
@@ -13,13 +15,16 @@ mod activation;
 mod capture;
 mod chain;
 mod commands;
+mod compositor;
 mod dispatch;
 mod dump;
 mod extensions;
 mod hooks;
 mod loader;
 mod pipelines;
+mod present;
 mod stereo;
+mod swapchain;
 
 use std::ffi::c_char;
 

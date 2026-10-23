@@ -66,6 +66,37 @@ struct Args {
     /// Print the device's extensions and the layer-hidden feature bits after start-up.
     #[arg(long)]
     list_device_extensions: bool,
+
+    /// Resize the window before rendering a frame, recreating the swapchain:
+    /// `<frame>:<width>x<height>`, e.g. `30:960x540`.
+    #[arg(long, value_parser = parse_resize)]
+    resize: Option<Resize>,
+}
+
+/// A scripted window resize.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Resize {
+    /// The first frame rendered at the new size.
+    frame: u32,
+    extent: vk::Extent2D,
+}
+
+fn parse_resize(text: &str) -> Result<Resize, String> {
+    let invalid = || format!("expected <frame>:<width>x<height>, got {text:?}");
+    let (frame, size) = text.split_once(':').ok_or_else(invalid)?;
+    let (width, height) = size.split_once('x').ok_or_else(invalid)?;
+    let number = |part: &str| part.parse::<u32>().map_err(|_| invalid());
+    let resize = Resize {
+        frame: number(frame)?,
+        extent: vk::Extent2D {
+            width: number(width)?,
+            height: number(height)?,
+        },
+    };
+    if resize.extent.width == 0 || resize.extent.height == 0 {
+        return Err(invalid());
+    }
+    Ok(resize)
 }
 
 fn main() -> Result<()> {
@@ -88,6 +119,8 @@ fn main() -> Result<()> {
 struct App {
     args: Args,
     frame: u32,
+    /// The window's current size.
+    extent: vk::Extent2D,
     // Declared before `window`: the surface must be destroyed before its window.
     renderer: Option<Renderer>,
     window: Option<Window>,
@@ -99,6 +132,10 @@ impl App {
         Self {
             args,
             frame: 0,
+            extent: vk::Extent2D {
+                width: WIDTH,
+                height: HEIGHT,
+            },
             renderer: None,
             window: None,
             failure: None,
@@ -108,17 +145,13 @@ impl App {
     fn start(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
         let attributes = Window::default_attributes()
             .with_title("Stereophonics3D test scene")
-            .with_inner_size(PhysicalSize::new(WIDTH, HEIGHT))
+            .with_inner_size(PhysicalSize::new(self.extent.width, self.extent.height))
             .with_resizable(false);
         let window = event_loop.create_window(attributes)?;
-        let extent = vk::Extent2D {
-            width: WIDTH,
-            height: HEIGHT,
-        };
         let renderer = Renderer::new(
             &window,
             &self.scene(0),
-            extent,
+            self.extent,
             self.args.rendering,
             self.args.validate,
         )?;
@@ -132,12 +165,32 @@ impl App {
     }
 
     fn scene(&self, frame: u32) -> Scene {
-        Scene::build(self.args.scene, WIDTH as f32 / HEIGHT as f32, frame)
+        let vk::Extent2D { width, height } = self.extent;
+        Scene::build(self.args.scene, width as f32 / height as f32, frame)
+    }
+
+    /// Applies the scripted resize when its frame comes up: resizes the window, then
+    /// recreates the swapchain at the new size.
+    fn resize_if_due(&mut self) -> Result<()> {
+        let Some(resize) = self.args.resize.filter(|r| r.frame == self.frame) else {
+            return Ok(());
+        };
+        let (Some(window), Some(renderer)) = (&self.window, self.renderer.as_mut()) else {
+            return Ok(());
+        };
+        let vk::Extent2D { width, height } = resize.extent;
+        // Applied synchronously on Windows, so the surface reports the new size at once.
+        let _ = window.request_inner_size(PhysicalSize::new(width, height));
+        renderer.resize(resize.extent)?;
+        self.extent = resize.extent;
+        Ok(())
     }
 
     /// Renders one frame and reports whether the run is complete.
     fn step(&mut self) -> Result<bool> {
+        self.resize_if_due()?;
         let scene = self.scene(self.frame);
+        let size = (self.extent.width, self.extent.height);
         let Some(renderer) = self.renderer.as_mut() else {
             return Ok(false);
         };
@@ -145,13 +198,13 @@ impl App {
         let needs_pixels = last && (self.args.capture.is_some() || self.args.self_check);
         if let Some(readback) = renderer.render(&scene, needs_pixels)? {
             if let Some(dir) = &self.args.capture {
-                let sidecar = capture::sidecar(&scene, (WIDTH, HEIGHT), self.args.rendering.name());
+                let sidecar = capture::sidecar(&scene, size, self.args.rendering.name());
                 let path = capture::write(dir, &readback, &sidecar)?;
                 tracing::info!(path = %path.display(), "captured frame");
                 println!("captured {}", path.display());
             }
             if self.args.self_check {
-                self_check(&scene, &readback.rgba)?;
+                self_check(&scene, size, &readback.rgba)?;
             }
         }
         self.frame += 1;
@@ -186,15 +239,15 @@ impl App {
 }
 
 /// Fails unless the counter decoded from `rgba` equals the scene's counter.
-fn self_check(scene: &Scene, rgba: &[u8]) -> Result<()> {
+fn self_check(scene: &Scene, (width, height): (u32, u32), rgba: &[u8]) -> Result<()> {
     let Some(expected) = scene.counter else {
         println!("self-check: scene {} has no counter", scene.id.name());
         return Ok(());
     };
-    let probes = capture::sidecar(scene, (WIDTH, HEIGHT), "").probes;
+    let probes = capture::sidecar(scene, (width, height), "").probes;
     let image = Image {
-        width: WIDTH,
-        height: HEIGHT,
+        width,
+        height,
         rgba: rgba.to_vec(),
     };
     let decoded = s3d_verify::counter::decode(&image, &probes)?;
@@ -232,6 +285,32 @@ impl ApplicationHandler for App {
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
         if let Some(window) = &self.window {
             window.request_redraw();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_resize_reads_frame_and_size() {
+        assert_eq!(
+            parse_resize("30:960x540"),
+            Ok(Resize {
+                frame: 30,
+                extent: vk::Extent2D {
+                    width: 960,
+                    height: 540,
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn test_parse_resize_rejects_malformed_and_empty_sizes() {
+        for text in ["960x540", "30:960", "30:x540", "a:960x540", "30:0x540"] {
+            assert!(parse_resize(text).is_err(), "{text} parsed");
         }
     }
 }

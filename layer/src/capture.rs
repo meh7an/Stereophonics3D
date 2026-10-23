@@ -1,31 +1,20 @@
 //! Per-eye frame capture: copies a presented swapchain image to the host and writes it,
 //! with a sidecar, in the capture format of `s3d_shared::capture`.
 //!
-//! The copy runs on the presenting queue, waits on the present's semaphores itself and
-//! completes before the present, so the present no longer waits on them. Swapchains get
-//! `TRANSFER_SRC` usage added at creation so their images can be copied at all.
+//! The copy is recorded into the layer's present-time submission after any composite, so
+//! it reads exactly what reaches the screen. Real swapchains get `TRANSFER_SRC` usage
+//! added at creation so their images can be copied at all.
 
-use std::{
-    collections::HashMap,
-    ffi::c_void,
-    path::PathBuf,
-    sync::{Arc, RwLock},
-};
+use std::{ffi::c_void, path::PathBuf, sync::Arc};
 
 use ash::vk::{self, Handle};
 use s3d_shared::{
     Settings,
     capture::{CapturePaths, Sidecar, StereoMethod, StereoRecord, write_png, write_sidecar},
-    ffi::ffi_guard,
-    settings::default_capture_dir,
+    settings::{Snapshot, default_capture_dir},
 };
 
-use crate::{
-    activation,
-    dispatch::{DeviceData, read, write},
-    hooks::next_device_fn,
-    loader::SetDeviceLoaderData,
-};
+use crate::{activation, compositor::memory_type, dispatch::DeviceData, swapchain::DeviceContext};
 
 /// Why a capture failed.
 #[derive(Debug, thiserror::Error)]
@@ -34,242 +23,68 @@ pub enum CaptureError {
     Vulkan(#[from] vk::Result),
     #[error("swapchain format {0:?} cannot be written as RGBA8")]
     Format(vk::Format),
+    #[error("the swapchain was created without TRANSFER_SRC usage")]
+    Usage,
     #[error("no host-visible memory for the readback buffer")]
     NoMemory,
-    #[error("the present uses an unknown queue or swapchain")]
-    Unknown,
     #[error(transparent)]
     File(#[from] s3d_shared::Error),
 }
 
-#[derive(Debug)]
-struct SwapchainInfo {
-    format: vk::Format,
+/// The presented image a capture copies.
+#[derive(Debug, Clone, Copy)]
+pub struct Target {
+    pub image: vk::Image,
+    pub format: vk::Format,
+    pub extent: vk::Extent2D,
+    pub usage: vk::ImageUsageFlags,
+}
+
+/// The current snapshot when its settings ask for present `frame` to be captured.
+pub fn wanted(frame: u64) -> Option<Arc<Snapshot>> {
+    let snapshot = activation::get().snapshot()?;
+    let settings = snapshot.settings.as_ref()?;
+    (settings.capture.frame.map(u64::from) == Some(frame)).then_some(snapshot)
+}
+
+/// A recorded capture copy waiting for its submission to finish.
+pub struct Pending<'a> {
+    resources: Resources<'a>,
+    pub command_buffer: vk::CommandBuffer,
+    swizzle: bool,
     extent: vk::Extent2D,
-    images: Vec<vk::Image>,
 }
 
-/// Per-device capture state.
-pub struct CaptureState {
-    /// Queue family of every queue the application retrieved.
-    queues: RwLock<HashMap<vk::Queue, u32>>,
-    swapchains: RwLock<HashMap<vk::SwapchainKHR, Arc<SwapchainInfo>>>,
-    memory: vk::PhysicalDeviceMemoryProperties,
-    set_loader_data: Option<SetDeviceLoaderData>,
-    swapchain_fn: ash::khr::swapchain::DeviceFn,
-}
-
-impl CaptureState {
-    pub fn new(
-        memory: vk::PhysicalDeviceMemoryProperties,
-        set_loader_data: Option<SetDeviceLoaderData>,
-        swapchain_fn: ash::khr::swapchain::DeviceFn,
-    ) -> Self {
-        Self {
-            queues: RwLock::new(HashMap::new()),
-            swapchains: RwLock::new(HashMap::new()),
-            memory,
-            set_loader_data,
-            swapchain_fn,
-        }
-    }
-
-    fn record_queue(&self, queue: vk::Queue, family: u32) {
-        if queue != vk::Queue::null() {
-            write(&self.queues).insert(queue, family);
-        }
-    }
-}
-
-pub unsafe extern "system" fn get_device_queue(
-    device: vk::Device,
+/// Records a copy of `target` into a host buffer, for submission on a queue of `family`.
+///
+/// # Errors
+///
+/// An unsupported format or usage, or a failed Vulkan call.
+///
+/// # Safety
+///
+/// `target` must be a live presentable image of `data`'s device that will be in
+/// `PRESENT_SRC_KHR` when the copy executes, and `family` a queue family of that device.
+pub unsafe fn record<'a>(
+    data: &'a DeviceData,
+    context: &DeviceContext,
     family: u32,
-    index: u32,
-    queue: *mut vk::Queue,
-) {
-    // SAFETY: a live device from the application.
-    let found = unsafe { next_device_fn("vkGetDeviceQueue", device, |f| f.get_device_queue) };
-    let Some((data, next)) = found else {
-        return;
-    };
-    // SAFETY: the next layer's query with the application's arguments.
-    unsafe { next(device, family, index, queue) };
-    // SAFETY: the query just wrote the handle.
-    ffi_guard("vkGetDeviceQueue", (), || unsafe {
-        data.capture.record_queue(*queue, family)
-    });
-}
-
-pub unsafe extern "system" fn get_device_queue2(
-    device: vk::Device,
-    info: *const vk::DeviceQueueInfo2<'_>,
-    queue: *mut vk::Queue,
-) {
-    // SAFETY: a live device from the application.
-    let found = unsafe { next_device_fn("vkGetDeviceQueue2", device, |f| f.get_device_queue2) };
-    let Some((data, next)) = found else {
-        return;
-    };
-    // SAFETY: the next layer's query with the application's arguments.
-    unsafe { next(device, info, queue) };
-    // SAFETY: a valid queue info, and the query just wrote the handle.
-    ffi_guard("vkGetDeviceQueue2", (), || unsafe {
-        data.capture
-            .record_queue(*queue, (*info).queue_family_index)
-    });
-}
-
-pub unsafe extern "system" fn create_swapchain(
-    device: vk::Device,
-    info: *const vk::SwapchainCreateInfoKHR<'_>,
-    allocator: *const vk::AllocationCallbacks<'_>,
-    swapchain: *mut vk::SwapchainKHR,
-) -> vk::Result {
-    // SAFETY: a live device from the application.
-    let found = unsafe { next_device_fn("vkCreateSwapchainKHR", device, |f| f.create_swapchain) };
-    let Some((data, next)) = found else {
-        return vk::Result::ERROR_INITIALIZATION_FAILED;
-    };
-    // SAFETY: a copy of the application's create info that may also be copied from.
-    let info =
-        unsafe { (*info).image_usage((*info).image_usage | vk::ImageUsageFlags::TRANSFER_SRC) };
-    // SAFETY: the next layer's create with the extended copy.
-    let result = unsafe { next(device, &info, allocator, swapchain) };
-    if result == vk::Result::SUCCESS {
-        ffi_guard("vkCreateSwapchainKHR", (), || {
-            // SAFETY: the swapchain was just created on this device.
-            let handle = unsafe { *swapchain };
-            match unsafe { swapchain_images(&data, device, handle) } {
-                Ok(images) => {
-                    let swapchain = Arc::new(SwapchainInfo {
-                        format: info.image_format,
-                        extent: info.image_extent,
-                        images,
-                    });
-                    write(&data.capture.swapchains).insert(handle, swapchain);
-                }
-                Err(error) => tracing::warn!(%error, "cannot list swapchain images"),
-            }
-        });
-    }
-    result
-}
-
-/// The images of a swapchain, from the next layer.
-///
-/// # Safety
-///
-/// `swapchain` must be a live swapchain of `device`.
-unsafe fn swapchain_images(
-    data: &DeviceData,
-    device: vk::Device,
-    swapchain: vk::SwapchainKHR,
-) -> Result<Vec<vk::Image>, vk::Result> {
-    let get = data.capture.swapchain_fn.get_swapchain_images_khr;
-    let mut count = 0;
-    // SAFETY: a count query on a live swapchain.
-    unsafe { get(device, swapchain, &mut count, std::ptr::null_mut()) }.result()?;
-    let mut images = vec![vk::Image::null(); count as usize];
-    // SAFETY: `images` holds `count` handles.
-    unsafe { get(device, swapchain, &mut count, images.as_mut_ptr()) }.result()?;
-    images.truncate(count as usize);
-    Ok(images)
-}
-
-pub unsafe extern "system" fn destroy_swapchain(
-    device: vk::Device,
-    swapchain: vk::SwapchainKHR,
-    allocator: *const vk::AllocationCallbacks<'_>,
-) {
-    // SAFETY: a live device from the application.
-    let found = unsafe { next_device_fn("vkDestroySwapchainKHR", device, |f| f.destroy_swapchain) };
-    let Some((data, next)) = found else {
-        return;
-    };
-    ffi_guard("vkDestroySwapchainKHR", (), || {
-        write(&data.capture.swapchains).remove(&swapchain);
-    });
-    // SAFETY: the next layer's destroy with the application's arguments.
-    unsafe { next(device, swapchain, allocator) };
-}
-
-/// Captures the present's first image when the settings ask for frame `frame`. Returns
-/// whether the capture consumed the present's wait semaphores, in which case the
-/// present must be issued without them.
-///
-/// # Safety
-///
-/// `queue` and `info` must be the application's present arguments.
-pub unsafe fn on_present(
-    data: &DeviceData,
-    queue: vk::Queue,
-    info: &vk::PresentInfoKHR<'_>,
-    frame: u64,
-) -> bool {
-    let activation = activation::get();
-    let Some(snapshot) = activation.snapshot() else {
-        return false;
-    };
-    let Some(settings) = &snapshot.settings else {
-        return false;
-    };
-    if settings.capture.frame.map(u64::from) != Some(frame) || info.swapchain_count == 0 {
-        return false;
-    }
-    let mut consumed = false;
-    // SAFETY: forwarded from the caller.
-    let result = unsafe { capture(data, queue, info, &mut consumed) };
-    match result.and_then(|rgba| save(settings, &activation.executable, frame, rgba)) {
-        Ok(path) => tracing::info!(frame, path = %path.display(), "captured frame"),
-        Err(error) => tracing::warn!(frame, %error, "capture failed"),
-    }
-    consumed
-}
-
-/// Pixels and size of a capture.
-struct Rgba {
-    width: u32,
-    height: u32,
-    pixels: Vec<u8>,
-}
-
-/// Copies the first presented image to the host as RGBA8 rows.
-///
-/// # Safety
-///
-/// As [`on_present`].
-unsafe fn capture(
-    data: &DeviceData,
-    queue: vk::Queue,
-    info: &vk::PresentInfoKHR<'_>,
-    consumed: &mut bool,
-) -> Result<Rgba, CaptureError> {
-    let state = &data.capture;
-    let family = *read(&state.queues)
-        .get(&queue)
-        .ok_or(CaptureError::Unknown)?;
-    // SAFETY: the present names at least one swapchain and image index.
-    let (swapchain, index) = unsafe { (*info.p_swapchains, *info.p_image_indices) };
-    let swapchain = read(&state.swapchains)
-        .get(&swapchain)
-        .cloned()
-        .ok_or(CaptureError::Unknown)?;
-    let swizzle = match swapchain.format {
+    target: &Target,
+) -> Result<Pending<'a>, CaptureError> {
+    let swizzle = match target.format {
         vk::Format::B8G8R8A8_UNORM | vk::Format::B8G8R8A8_SRGB => true,
         vk::Format::R8G8B8A8_UNORM | vk::Format::R8G8B8A8_SRGB => false,
         other => return Err(CaptureError::Format(other)),
     };
-    let image = *swapchain
-        .images
-        .get(index as usize)
-        .ok_or(CaptureError::Unknown)?;
-    let vk::Extent2D { width, height } = swapchain.extent;
+    if !target.usage.contains(vk::ImageUsageFlags::TRANSFER_SRC) {
+        return Err(CaptureError::Usage);
+    }
+    let vk::Extent2D { width, height } = target.extent;
     let size = u64::from(width) * u64::from(height) * 4;
 
     let mut resources = Resources::new(&data.next);
-    // SAFETY: every object is created on this device, used once and destroyed by
-    // `resources` when it drops; the submission waits on the application's semaphores and
-    // finishes (fence wait) before the image is presented.
+    // SAFETY: every object is created on this device and destroyed by `resources` when it
+    // drops, which `Pending::finish` does only after the submission has finished.
     unsafe {
         let device = &data.next;
         let pool = device.create_command_pool(
@@ -285,7 +100,7 @@ unsafe fn capture(
                 .level(vk::CommandBufferLevel::PRIMARY)
                 .command_buffer_count(1),
         )?[0];
-        if let Some(set_loader_data) = state.set_loader_data {
+        if let Some(set_loader_data) = data.swapchains.set_loader_data {
             set_loader_data(data.handle, command_buffer.as_raw() as *mut c_void).result()?;
         }
         let buffer = device.create_buffer(
@@ -297,7 +112,7 @@ unsafe fn capture(
         resources.buffer = buffer;
         let requirements = device.get_buffer_memory_requirements(buffer);
         let wanted = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
-        let memory_type = memory_type(&state.memory, requirements.memory_type_bits, wanted)
+        let memory_type = memory_type(&context.memory, requirements.memory_type_bits, wanted)
             .ok_or(CaptureError::NoMemory)?;
         let memory = device.allocate_memory(
             &vk::MemoryAllocateInfo::default()
@@ -306,39 +121,65 @@ unsafe fn capture(
             None,
         )?;
         resources.memory = memory;
+        resources.size = size;
         device.bind_buffer_memory(buffer, memory, 0)?;
-        record_copy(device, command_buffer, image, buffer, swapchain.extent)?;
-        let fence = device.create_fence(&vk::FenceCreateInfo::default(), None)?;
-        resources.fence = fence;
+        record_copy(device, command_buffer, target.image, buffer, target.extent)?;
+        Ok(Pending {
+            resources,
+            command_buffer,
+            swizzle,
+            extent: target.extent,
+        })
+    }
+}
 
-        let waits = if info.p_wait_semaphores.is_null() {
-            &[][..]
-        } else {
-            std::slice::from_raw_parts(info.p_wait_semaphores, info.wait_semaphore_count as usize)
+impl Pending<'_> {
+    /// Reads the copy back and writes the capture; returns the image path.
+    ///
+    /// # Errors
+    ///
+    /// A failed map or file write.
+    ///
+    /// # Safety
+    ///
+    /// The submission holding `command_buffer` must have finished.
+    pub unsafe fn finish(self, settings: &Settings, frame: u64) -> Result<PathBuf, CaptureError> {
+        let Resources {
+            device,
+            memory,
+            size,
+            ..
+        } = &self.resources;
+        let (memory, size) = (*memory, *size);
+        // SAFETY: the copy finished and the memory is host-visible and coherent.
+        let mut pixels = unsafe {
+            let mapped = device.map_memory(memory, 0, size, vk::MemoryMapFlags::empty())?;
+            let pixels = std::slice::from_raw_parts(mapped.cast::<u8>(), size as usize).to_vec();
+            device.unmap_memory(memory);
+            pixels
         };
-        let stages = vec![vk::PipelineStageFlags::ALL_COMMANDS; waits.len()];
-        let command_buffers = [command_buffer];
-        let submit = vk::SubmitInfo::default()
-            .wait_semaphores(waits)
-            .wait_dst_stage_mask(&stages)
-            .command_buffers(&command_buffers);
-        device.queue_submit(queue, &[submit], fence)?;
-        *consumed = true;
-        device.wait_for_fences(&[fence], true, u64::MAX)?;
-
-        let mapped = device.map_memory(memory, 0, size, vk::MemoryMapFlags::empty())?;
-        let mut pixels = std::slice::from_raw_parts(mapped.cast::<u8>(), size as usize).to_vec();
-        device.unmap_memory(memory);
-        if swizzle {
+        if self.swizzle {
             let (bgra, _) = pixels.as_chunks_mut::<4>();
             bgra.iter_mut().for_each(|pixel| pixel.swap(0, 2));
         }
-        Ok(Rgba {
-            width,
-            height,
-            pixels,
-        })
+        save(
+            settings,
+            &activation::get().executable,
+            frame,
+            Rgba {
+                width: self.extent.width,
+                height: self.extent.height,
+                pixels,
+            },
+        )
     }
+}
+
+/// Pixels and size of a capture.
+struct Rgba {
+    width: u32,
+    height: u32,
+    pixels: Vec<u8>,
 }
 
 /// Records the image-to-buffer copy, leaving the image in `PRESENT_SRC_KHR` again.
@@ -425,27 +266,13 @@ unsafe fn record_copy(
     }
 }
 
-/// The first memory type allowed by `bits` with all of `wanted`.
-fn memory_type(
-    memory: &vk::PhysicalDeviceMemoryProperties,
-    bits: u32,
-    wanted: vk::MemoryPropertyFlags,
-) -> Option<u32> {
-    (0..memory.memory_type_count).find(|&index| {
-        bits & (1 << index) != 0
-            && memory.memory_types[index as usize]
-                .property_flags
-                .contains(wanted)
-    })
-}
-
 /// Objects a capture creates, destroyed in reverse order when it ends.
 struct Resources<'a> {
     device: &'a ash::Device,
     pool: vk::CommandPool,
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
-    fence: vk::Fence,
+    size: vk::DeviceSize,
 }
 
 impl<'a> Resources<'a> {
@@ -455,7 +282,7 @@ impl<'a> Resources<'a> {
             pool: vk::CommandPool::null(),
             buffer: vk::Buffer::null(),
             memory: vk::DeviceMemory::null(),
-            fence: vk::Fence::null(),
+            size: 0,
         }
     }
 }
@@ -463,10 +290,9 @@ impl<'a> Resources<'a> {
 impl Drop for Resources<'_> {
     fn drop(&mut self) {
         // SAFETY: each handle is null or was created by the capture on this device, and
-        // the GPU is done with them: either the fence wait returned or nothing was
-        // submitted. Destroying null handles is a no-op.
+        // the GPU is done with them: either the submission finished or it never happened.
+        // Destroying null handles is a no-op.
         unsafe {
-            self.device.destroy_fence(self.fence, None);
             self.device.free_memory(self.memory, None);
             self.device.destroy_buffer(self.buffer, None);
             self.device.destroy_command_pool(self.pool, None);
@@ -499,24 +325,4 @@ fn save(
     let sidecar = Sidecar::injector(stem, frame, (rgba.width, rgba.height), stereo);
     write_sidecar(&paths.sidecar(), &sidecar)?;
     Ok(image)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_memory_type_needs_every_wanted_flag() {
-        let mut memory = vk::PhysicalDeviceMemoryProperties {
-            memory_type_count: 3,
-            ..Default::default()
-        };
-        memory.memory_types[0].property_flags = vk::MemoryPropertyFlags::DEVICE_LOCAL;
-        memory.memory_types[1].property_flags = vk::MemoryPropertyFlags::HOST_VISIBLE;
-        memory.memory_types[2].property_flags =
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
-        let wanted = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
-        assert_eq!(memory_type(&memory, 0b111, wanted), Some(2));
-        assert_eq!(memory_type(&memory, 0b011, wanted), None);
-    }
 }

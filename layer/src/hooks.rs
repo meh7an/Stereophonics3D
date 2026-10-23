@@ -13,30 +13,31 @@ use ash::vk::{self, Handle};
 use s3d_shared::ffi::ffi_guard;
 
 use crate::{
-    activation,
-    capture::{self, CaptureState},
-    commands,
+    activation, commands,
     dispatch::{self, DeviceData, InstanceData, key},
     extensions::{self, InstanceFns},
-    loader, pipelines,
+    loader, pipelines, present,
     stereo::{self, StereoState},
+    swapchain::{self, DeviceContext, SwapchainState},
 };
 
 /// Frames between progress lines in the log.
-const FRAME_LOG_INTERVAL: u64 = 600;
+pub const FRAME_LOG_INTERVAL: u64 = 600;
 
 function_table! {
     /// Device-level functions the layer replaces for active processes.
     DeviceFns, vk::Device, vk::PFN_vkGetDeviceProcAddr {
         queue_present: c"vkQueuePresentKHR" => vk::PFN_vkQueuePresentKHR = queue_present,
         get_device_queue: c"vkGetDeviceQueue"
-            => vk::PFN_vkGetDeviceQueue = capture::get_device_queue,
+            => vk::PFN_vkGetDeviceQueue = swapchain::get_device_queue,
         get_device_queue2: c"vkGetDeviceQueue2"
-            => vk::PFN_vkGetDeviceQueue2 = capture::get_device_queue2,
+            => vk::PFN_vkGetDeviceQueue2 = swapchain::get_device_queue2,
         create_swapchain: c"vkCreateSwapchainKHR"
-            => vk::PFN_vkCreateSwapchainKHR = capture::create_swapchain,
+            => vk::PFN_vkCreateSwapchainKHR = swapchain::create_swapchain,
         destroy_swapchain: c"vkDestroySwapchainKHR"
-            => vk::PFN_vkDestroySwapchainKHR = capture::destroy_swapchain,
+            => vk::PFN_vkDestroySwapchainKHR = swapchain::destroy_swapchain,
+        get_swapchain_images: c"vkGetSwapchainImagesKHR"
+            => vk::PFN_vkGetSwapchainImagesKHR = swapchain::get_swapchain_images,
         create_shader_module: c"vkCreateShaderModule"
             => vk::PFN_vkCreateShaderModule = pipelines::create_shader_module,
         destroy_shader_module: c"vkDestroyShaderModule"
@@ -315,9 +316,20 @@ unsafe extern "system" fn create_device(
                 let properties = instance.as_ref().map_or_else(Default::default, |i| {
                     i.next.get_physical_device_properties(physical_device)
                 });
-                let memory = instance.as_ref().map_or_else(Default::default, |i| {
-                    i.next
-                        .get_physical_device_memory_properties(physical_device)
+                let context = instance.as_ref().map(|i| DeviceContext {
+                    instance: i.next.clone(),
+                    physical_device,
+                    memory: i
+                        .next
+                        .get_physical_device_memory_properties(physical_device),
+                    families: i
+                        .next
+                        .get_physical_device_queue_family_properties(physical_device),
+                    requested_families: requested_families(&*create_info),
+                    timestamp_period: properties.limits.timestamp_period,
+                    surface_fn: ash::khr::surface::InstanceFn::load(|name| {
+                        as_void(next_gipa(owner, name.as_ptr()))
+                    }),
                 });
                 let enabled = extensions::enabled(&*create_info);
                 let next_create = cast!(
@@ -360,8 +372,8 @@ unsafe extern "system" fn create_device(
                             &enabled,
                             stereo::layout_rules(&*create_info, properties.api_version, &enabled),
                         ),
-                        capture: CaptureState::new(
-                            memory,
+                        swapchains: SwapchainState::new(
+                            context,
                             set_loader_data,
                             ash::khr::swapchain::DeviceFn::load(|name| {
                                 as_void(next_gdpa(handle, name.as_ptr()))
@@ -391,9 +403,35 @@ unsafe extern "system" fn destroy_device(
         let (modules, layouts, pipelines) = data.tracker.counts();
         tracing::info!(frames, modules, layouts, pipelines, "device destroyed");
         ffi_guard("vkDestroyDevice", (), || data.stereo.destroy(&data.next));
+        // SAFETY: the device is being destroyed; the swapchain state owns its objects.
+        ffi_guard("vkDestroyDevice", (), || unsafe {
+            data.swapchains.destroy(&data.next)
+        });
         // SAFETY: the next layer's destroy with the handle it created.
         unsafe { (data.destroy)(data.handle, allocator) };
     }
+}
+
+/// The queue families a device create info asks for.
+///
+/// # Safety
+///
+/// `info` must be a valid device create info.
+unsafe fn requested_families(info: &vk::DeviceCreateInfo<'_>) -> Vec<u32> {
+    if info.p_queue_create_infos.is_null() {
+        return Vec::new();
+    }
+    // SAFETY: a valid create info holds this many queue create infos.
+    let queues = unsafe {
+        std::slice::from_raw_parts(
+            info.p_queue_create_infos,
+            info.queue_create_info_count as usize,
+        )
+    };
+    queues
+        .iter()
+        .map(|queue| queue.queue_family_index)
+        .collect()
 }
 
 /// A `GetProcAddr` result as the untyped pointer `ash` loads tables from.
@@ -418,18 +456,19 @@ unsafe extern "system" fn queue_present(
     let Some((data, next, index)) = found else {
         return vk::Result::ERROR_DEVICE_LOST;
     };
-    // SAFETY: the application's present arguments.
-    let consumed = ffi_guard("vkQueuePresentKHR", false, || unsafe {
-        capture::on_present(&data, queue, &*present_info, index)
+    // SAFETY: the application's present arguments, on the queue it synchronises.
+    let waits = ffi_guard("vkQueuePresentKHR", None, || unsafe {
+        present::prepare(&data, queue, &*present_info, index)
     });
-    if consumed {
-        // The capture already waited on the semaphores and finished on this queue.
-        // SAFETY: a copy of the application's present info without the waits.
-        let info = unsafe { *present_info }.wait_semaphores(&[]);
-        // SAFETY: the next layer's present with that copy.
-        unsafe { next(queue, &info) }
-    } else {
+    match waits {
+        Some(waits) => {
+            // The layer's submission already waited on the application's semaphores.
+            // SAFETY: a copy of the application's present info waiting on the layer's.
+            let info = unsafe { *present_info }.wait_semaphores(&waits);
+            // SAFETY: the next layer's present with that copy.
+            unsafe { next(queue, &info) }
+        }
         // SAFETY: the next layer's present with the application's arguments.
-        unsafe { next(queue, present_info) }
+        None => unsafe { next(queue, present_info) },
     }
 }

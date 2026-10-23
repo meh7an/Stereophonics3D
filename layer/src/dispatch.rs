@@ -15,8 +15,8 @@ use std::{
 use ash::vk::{self, Handle};
 
 use crate::{
-    capture::CaptureState, commands::CommandTracker, extensions::InstanceFns, hooks::DeviceFns,
-    pipelines::Tracker, stereo::StereoState,
+    commands::CommandTracker, extensions::InstanceFns, hooks::DeviceFns, pipelines::Tracker,
+    stereo::StereoState, swapchain::SwapchainState,
 };
 
 pub type Key = usize;
@@ -56,7 +56,7 @@ pub struct DeviceData {
     pub tracker: Tracker,
     pub commands: CommandTracker,
     pub stereo: StereoState,
-    pub capture: CaptureState,
+    pub swapchains: SwapchainState,
 }
 
 impl DeviceData {
