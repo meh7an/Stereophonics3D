@@ -8,6 +8,8 @@ max_parallax_percent = 3.0
 convergence = 4.0
 # Exchange the eyes, for glasses worn the other way round.
 swap_eyes = false
+# Single-eye test mode: render the whole frame as "left" or "right". Absent renders mono.
+# eye = "left"
 
 [anaglyph]
 # A preset (dubois-2001, dubois-2009, zhang-lcd, color, half-color, gray) or three rows
@@ -20,3 +22,8 @@ gamma = 1.0
 # Write every shader the game creates to %LOCALAPPDATA%\Stereophonics3D\dumps\<exe>\
 # as <hash>.spv plus <hash>.spvasm disassembly.
 shaders = false
+
+[capture]
+# Presented frame (counting from 0) the layer saves per eye to
+# %LOCALAPPDATA%\Stereophonics3D\captures\<exe>\. Absent captures nothing.
+# frame = 60

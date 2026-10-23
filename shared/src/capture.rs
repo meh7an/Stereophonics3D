@@ -2,7 +2,8 @@
 //!
 //! The test scene writes mono captures, the layer writes per-eye dumps of the same frame,
 //! and the verifier reads both. One frame produces `<scene>-f<frame:05>.json` plus either
-//! `<stem>.png` (mono) or `<stem>-left.png` and `<stem>-right.png` (per eye).
+//! `<stem>.png` (mono) or `<stem>-left.png` and `<stem>-right.png` (per eye), and
+//! optionally `<stem>-depth.f32`: the depth buffer as little-endian `f32` rows.
 
 use std::{
     fs,
@@ -143,6 +144,10 @@ impl CapturePaths {
         self.with_suffix(".json")
     }
 
+    pub fn depth(&self) -> PathBuf {
+        self.with_suffix("-depth.f32")
+    }
+
     fn with_suffix(&self, suffix: &str) -> PathBuf {
         let mut path = self.stem.clone().into_os_string();
         path.push(suffix);
@@ -222,6 +227,78 @@ pub fn write_png(path: &Path, width: u32, height: u32, rgba: &[u8]) -> Result<()
 /// Returns an error when the file cannot be read or decoded.
 pub fn read_png(path: &Path) -> Result<Image> {
     decode_png(&read_file(path)?)
+}
+
+impl Sidecar {
+    /// A sidecar for a frame the injector captured from a game: size and stereo settings
+    /// only, since the injector knows no scene ground truth. Verification merges it with
+    /// the scene's own sidecar.
+    pub fn injector(
+        scene: &str,
+        frame: u32,
+        (width, height): (u32, u32),
+        stereo: Option<StereoRecord>,
+    ) -> Self {
+        Self {
+            scene: scene.to_owned(),
+            frame,
+            width,
+            height,
+            rendering: "injector".to_owned(),
+            camera: CameraRecord {
+                position: [0.0; 3],
+                target: [0.0; 3],
+                up: [0.0; 3],
+                vertical_fov_deg: 0.0,
+                near: 0.0,
+                far: 0.0,
+            },
+            view: [0.0; 16],
+            projection: [0.0; 16],
+            convergence: stereo.as_ref().map_or(0.0, |s| s.convergence),
+            clear_color: [0; 3],
+            backdrop_color: None,
+            light: None,
+            sky: false,
+            post: false,
+            markers: Vec::new(),
+            probes: Vec::new(),
+            counter: None,
+            stereo,
+        }
+    }
+}
+
+/// Writes a depth buffer as little-endian `f32` rows, creating parent directories.
+///
+/// # Errors
+///
+/// Returns an error when the file cannot be written.
+pub fn write_depth(path: &Path, depth: &[f32]) -> Result<()> {
+    let bytes: Vec<u8> = depth.iter().flat_map(|value| value.to_le_bytes()).collect();
+    write_file(path, &bytes)
+}
+
+/// Reads a depth dump of `width` x `height` floats.
+///
+/// # Errors
+///
+/// Returns an error when the file cannot be read or has the wrong size.
+pub fn read_depth(path: &Path, width: u32, height: u32) -> Result<Vec<f32>> {
+    let bytes = read_file(path)?;
+    let expected = width as usize * height as usize * 4;
+    if bytes.len() != expected {
+        return Err(Error::DepthSize {
+            path: path.to_path_buf(),
+            found: bytes.len(),
+            expected,
+        });
+    }
+    let (chunks, _) = bytes.as_chunks::<4>();
+    Ok(chunks
+        .iter()
+        .map(|chunk| f32::from_le_bytes(*chunk))
+        .collect())
 }
 
 /// Writes a sidecar as pretty JSON with a trailing newline, creating parent directories.
@@ -380,6 +457,20 @@ mod tests {
             .remove("backdrop_color");
         let loaded: Sidecar = serde_json::from_value(json).expect("older sidecar loads");
         assert_eq!(loaded.backdrop_color, None);
+    }
+
+    #[test]
+    fn test_depth_round_trips_and_checks_size() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = CapturePaths::new(dir.path(), "g0", 3).depth();
+        assert!(path.ends_with("g0-f00003-depth.f32"));
+        let depth = [0.0, 0.25, 1.0, 0.5];
+        write_depth(&path, &depth).expect("write");
+        assert_eq!(read_depth(&path, 2, 2).expect("read"), depth);
+        assert!(matches!(
+            read_depth(&path, 3, 2),
+            Err(Error::DepthSize { found: 16, .. })
+        ));
     }
 
     #[test]

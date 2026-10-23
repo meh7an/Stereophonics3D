@@ -17,6 +17,10 @@ pub enum Error {
     #[error("eye images do not match the sidecar's {width}x{height}")]
     Size { width: u32, height: u32 },
 
+    /// Captures that should belong together do not.
+    #[error("captures do not match: {0}")]
+    Mismatch(String),
+
     /// The capture lacks something a test needs, such as its markers.
     #[error("{test} cannot run: {reason}")]
     NotApplicable { test: &'static str, reason: String },

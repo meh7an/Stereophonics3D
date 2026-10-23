@@ -17,6 +17,8 @@ pub const CONFIG_DIR_ENV: &str = "S3D_CONFIG_DIR";
 pub const LOG_DIR_ENV: &str = "S3D_LOG_DIR";
 /// Overrides `%LOCALAPPDATA%\Stereophonics3D\dumps` as the shader dump directory.
 pub const DUMP_DIR_ENV: &str = "S3D_DUMP_DIR";
+/// Overrides `%LOCALAPPDATA%\Stereophonics3D\captures` as the frame capture directory.
+pub const CAPTURE_DIR_ENV: &str = "S3D_CAPTURE_DIR";
 
 /// User-mode modules of anti-cheat systems, as (lower-case file-name prefix, product).
 /// Kernel-only systems leave nothing to detect here; extend this list as products are

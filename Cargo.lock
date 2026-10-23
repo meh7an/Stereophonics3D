@@ -1469,6 +1469,7 @@ version = "0.1.0"
 dependencies = [
  "ash",
  "s3d-shared",
+ "s3d-spirv-patch",
  "s3d-spirv-val",
  "thiserror 2.0.21",
  "tracing",

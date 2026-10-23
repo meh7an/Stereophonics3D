@@ -43,6 +43,14 @@ struct FrameDraws {
     hud: (u32, u32),
 }
 
+/// One captured frame read back to the host.
+pub struct Readback {
+    /// The presented image as tightly packed RGBA8 rows, top to bottom.
+    pub rgba: Vec<u8>,
+    /// The main pass's depth buffer, one `f32` per pixel in the same order.
+    pub depth: Vec<f32>,
+}
+
 /// Draws one scene, one frame in flight at a time.
 ///
 /// The CPU waits for each frame before recording the next, which keeps synchronisation
@@ -52,6 +60,8 @@ pub struct Renderer {
     uniform_buffer: HostBuffer,
     vertex_buffer: HostBuffer,
     capture_buffer: HostBuffer,
+    /// Receives the main pass's depth buffer on captured frames.
+    depth_buffer: HostBuffer,
     shadow_map: DeviceImage,
     scene_color: Option<DeviceImage>,
     shadow_sampler: vk::Sampler,
@@ -165,10 +175,11 @@ impl Renderer {
                     vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
                 },
             }),
+            // Stored so captured frames can read it back.
             Some(AttachmentSpec {
                 format: DEPTH_FORMAT,
                 load: Load::Clear(clear_depth()),
-                store: false,
+                store: true,
                 initial: vk::ImageLayout::UNDEFINED,
                 final_layout: vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
             }),
@@ -251,6 +262,7 @@ impl Renderer {
         let vertex_buffer =
             HostBuffer::new(&ctx, vertex_capacity, vk::BufferUsageFlags::VERTEX_BUFFER)?;
         let capture_size = u64::from(extent.width) * u64::from(extent.height) * 4;
+        let depth_buffer = HostBuffer::new(&ctx, capture_size, vk::BufferUsageFlags::TRANSFER_DST)?;
         let capture_buffer =
             HostBuffer::new(&ctx, capture_size, vk::BufferUsageFlags::TRANSFER_DST)?;
 
@@ -340,6 +352,7 @@ impl Renderer {
             uniform_buffer,
             vertex_buffer,
             capture_buffer,
+            depth_buffer,
             shadow_map,
             scene_color,
             shadow_sampler,
@@ -364,14 +377,14 @@ impl Renderer {
         Ok(renderer)
     }
 
-    /// Renders and presents one frame of `scene`. With `capture`, also returns the
-    /// presented image as tightly packed RGBA8 rows, top to bottom.
     /// See [`Context::print_device_report`].
     pub fn print_device_report(&self) -> Result<()> {
         self.ctx.print_device_report()
     }
 
-    pub fn render(&mut self, scene: &Scene, capture: bool) -> Result<Option<Vec<u8>>> {
+    /// Renders and presents one frame of `scene`. With `capture`, also returns the
+    /// presented image and the main pass's depth buffer.
+    pub fn render(&mut self, scene: &Scene, capture: bool) -> Result<Option<Readback>> {
         let device = &self.ctx.device;
         unsafe {
             device.wait_for_fences(&[self.in_flight], true, u64::MAX)?;
@@ -405,12 +418,15 @@ impl Renderer {
 
         let pixels = if capture {
             unsafe { device.wait_for_fences(&[self.in_flight], true, u64::MAX)? };
-            let mut pixels = self.capture_buffer.read(device)?;
+            let mut rgba = self.capture_buffer.read(device)?;
             if self.swapchain.format == vk::Format::B8G8R8A8_UNORM {
-                let (bgra, _) = pixels.as_chunks_mut::<4>();
+                let (bgra, _) = rgba.as_chunks_mut::<4>();
                 bgra.iter_mut().for_each(|pixel| pixel.swap(0, 2));
             }
-            Some(pixels)
+            let bytes = self.depth_buffer.read(device)?;
+            let (floats, _) = bytes.as_chunks::<4>();
+            let depth = floats.iter().map(|f| f32::from_ne_bytes(*f)).collect();
+            Some(Readback { rgba, depth })
         } else {
             None
         };
@@ -567,6 +583,9 @@ impl Renderer {
             self.draw_mesh(draw);
         }
         self.main_pass.end(device, cmd, &main_target);
+        if capture {
+            self.copy_depth();
+        }
 
         if let (Some(post_pass), Some(tonemap), Some(post_set)) =
             (&self.post_pass, pipelines.tonemap, self.post_set)
@@ -684,6 +703,62 @@ impl Renderer {
         );
     }
 
+    /// Copies the main pass's depth buffer into `depth_buffer`, leaving it in its
+    /// attachment layout again.
+    fn copy_depth(&self) {
+        let device = &self.ctx.device;
+        let cmd = self.command_buffer;
+        let image = self.swapchain.depth.image;
+        layout_barrier(
+            device,
+            cmd,
+            image,
+            vk::ImageAspectFlags::DEPTH,
+            vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+        );
+        let region = vk::BufferImageCopy::default()
+            .image_subresource(
+                vk::ImageSubresourceLayers::default()
+                    .aspect_mask(vk::ImageAspectFlags::DEPTH)
+                    .layer_count(1),
+            )
+            .image_extent(self.swapchain.extent.into());
+        let buffer_barrier = vk::BufferMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::HOST_READ)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .buffer(self.depth_buffer.buffer)
+            .size(vk::WHOLE_SIZE);
+        unsafe {
+            device.cmd_copy_image_to_buffer(
+                cmd,
+                image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                self.depth_buffer.buffer,
+                &[region],
+            );
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[buffer_barrier],
+                &[],
+            );
+        }
+        layout_barrier(
+            device,
+            cmd,
+            image,
+            vk::ImageAspectFlags::DEPTH,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+        );
+    }
+
     /// Clears the shadow map to the far plane and leaves it in its sampled layout, so lit
     /// scenes without a shadow pass still bind a valid image.
     fn initialize_shadow_map(&self) -> Result<()> {
@@ -763,6 +838,7 @@ impl Drop for Renderer {
         }
         self.shadow_map.destroy(device);
         self.capture_buffer.destroy(device);
+        self.depth_buffer.destroy(device);
         self.vertex_buffer.destroy(device);
         self.uniform_buffer.destroy(device);
         self.swapchain.destroy(&self.ctx);

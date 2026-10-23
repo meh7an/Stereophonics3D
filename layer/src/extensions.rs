@@ -61,12 +61,12 @@ pub fn filter(properties: &mut Vec<vk::ExtensionProperties>) -> Vec<String> {
     removed
 }
 
-/// Hidden extensions named in a device's enabled-extension list.
+/// The extensions a device create info enables.
 ///
 /// # Safety
 ///
-/// `info` must be a valid device create info.
-pub unsafe fn requested_hidden(info: &vk::DeviceCreateInfo<'_>) -> Vec<String> {
+/// `info` must be a valid device create info; the names live as long as it does.
+pub unsafe fn enabled<'a>(info: &vk::DeviceCreateInfo<'a>) -> Vec<&'a CStr> {
     if info.pp_enabled_extension_names.is_null() {
         return Vec::new();
     }
@@ -81,6 +81,18 @@ pub unsafe fn requested_hidden(info: &vk::DeviceCreateInfo<'_>) -> Vec<String> {
         .iter()
         // SAFETY: each entry is a nul-terminated extension name.
         .map(|&name| unsafe { CStr::from_ptr(name) })
+        .collect()
+}
+
+/// Hidden extensions named in a device's enabled-extension list.
+///
+/// # Safety
+///
+/// `info` must be a valid device create info.
+pub unsafe fn requested_hidden(info: &vk::DeviceCreateInfo<'_>) -> Vec<String> {
+    // SAFETY: forwarded from the caller.
+    unsafe { enabled(info) }
+        .into_iter()
         .filter(|name| is_hidden(name))
         .map(|name| name.to_string_lossy().into_owned())
         .collect()

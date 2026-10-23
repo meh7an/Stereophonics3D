@@ -5,7 +5,7 @@
 //! that could panic.
 
 use std::{
-    ffi::{CStr, c_char},
+    ffi::{CStr, c_char, c_void},
     sync::{Arc, atomic::Ordering},
 };
 
@@ -13,10 +13,13 @@ use ash::vk::{self, Handle};
 use s3d_shared::ffi::ffi_guard;
 
 use crate::{
-    activation, commands,
+    activation,
+    capture::{self, CaptureState},
+    commands,
     dispatch::{self, DeviceData, InstanceData, key},
     extensions::{self, InstanceFns},
     loader, pipelines,
+    stereo::{self, StereoState},
 };
 
 /// Frames between progress lines in the log.
@@ -26,6 +29,14 @@ function_table! {
     /// Device-level functions the layer replaces for active processes.
     DeviceFns, vk::Device, vk::PFN_vkGetDeviceProcAddr {
         queue_present: c"vkQueuePresentKHR" => vk::PFN_vkQueuePresentKHR = queue_present,
+        get_device_queue: c"vkGetDeviceQueue"
+            => vk::PFN_vkGetDeviceQueue = capture::get_device_queue,
+        get_device_queue2: c"vkGetDeviceQueue2"
+            => vk::PFN_vkGetDeviceQueue2 = capture::get_device_queue2,
+        create_swapchain: c"vkCreateSwapchainKHR"
+            => vk::PFN_vkCreateSwapchainKHR = capture::create_swapchain,
+        destroy_swapchain: c"vkDestroySwapchainKHR"
+            => vk::PFN_vkDestroySwapchainKHR = capture::destroy_swapchain,
         create_shader_module: c"vkCreateShaderModule"
             => vk::PFN_vkCreateShaderModule = pipelines::create_shader_module,
         destroy_shader_module: c"vkDestroyShaderModule"
@@ -48,6 +59,8 @@ function_table! {
             => vk::PFN_vkFreeCommandBuffers = commands::free_command_buffers,
         cmd_bind_pipeline: c"vkCmdBindPipeline"
             => vk::PFN_vkCmdBindPipeline = commands::cmd_bind_pipeline,
+        cmd_push_constants: c"vkCmdPushConstants"
+            => vk::PFN_vkCmdPushConstants = commands::cmd_push_constants,
         cmd_draw: c"vkCmdDraw" => vk::PFN_vkCmdDraw = commands::cmd_draw,
         cmd_draw_indexed: c"vkCmdDrawIndexed"
             => vk::PFN_vkCmdDrawIndexed = commands::cmd_draw_indexed,
@@ -235,6 +248,10 @@ unsafe extern "system" fn create_instance(
                         next_get_instance_proc_addr: next_gipa,
                         destroy,
                         fns: InstanceFns::load(next_gipa, handle),
+                        next: ash::Instance::load_with(
+                            |name| as_void(next_gipa(handle, name.as_ptr())),
+                            handle,
+                        ),
                         active: activation::get().active,
                     },
                 );
@@ -273,6 +290,7 @@ unsafe extern "system" fn create_device(
         || {
             // SAFETY: as in `create_instance`, for the device chain.
             unsafe {
+                let set_loader_data = loader::device_loader_data((*create_info).p_next);
                 let Some(link) = loader::device_link((*create_info).p_next) else {
                     return vk::Result::ERROR_INITIALIZATION_FAILED;
                 };
@@ -287,13 +305,21 @@ unsafe extern "system" fn create_device(
 
                 let instance = dispatch::instance(key(physical_device));
                 let owner = instance.as_ref().map_or(vk::Instance::null(), |i| i.handle);
-                let active = instance.is_some_and(|i| i.active);
+                let active = instance.as_ref().is_some_and(|i| i.active);
                 if active {
                     let hidden = extensions::requested_hidden(&*create_info);
                     if !hidden.is_empty() {
                         tracing::warn!(?hidden, "application enables hidden extensions");
                     }
                 }
+                let properties = instance.as_ref().map_or_else(Default::default, |i| {
+                    i.next.get_physical_device_properties(physical_device)
+                });
+                let memory = instance.as_ref().map_or_else(Default::default, |i| {
+                    i.next
+                        .get_physical_device_memory_properties(physical_device)
+                });
+                let enabled = extensions::enabled(&*create_info);
                 let next_create = cast!(
                     next_gipa(owner, c"vkCreateDevice".as_ptr()),
                     vk::PFN_vkCreateDevice
@@ -321,10 +347,26 @@ unsafe extern "system" fn create_device(
                         next_get_device_proc_addr: next_gdpa,
                         destroy,
                         fns: DeviceFns::load(next_gdpa, handle),
+                        next: ash::Device::load_with(
+                            |name| as_void(next_gdpa(handle, name.as_ptr())),
+                            handle,
+                        ),
                         active,
                         frames: Default::default(),
                         tracker: Default::default(),
                         commands: Default::default(),
+                        stereo: StereoState::new(
+                            &properties,
+                            &enabled,
+                            stereo::layout_rules(&*create_info, properties.api_version, &enabled),
+                        ),
+                        capture: CaptureState::new(
+                            memory,
+                            set_loader_data,
+                            ash::khr::swapchain::DeviceFn::load(|name| {
+                                as_void(next_gdpa(handle, name.as_ptr()))
+                            }),
+                        ),
                     },
                 );
                 result
@@ -348,27 +390,46 @@ unsafe extern "system" fn destroy_device(
         let frames = data.frames.load(Ordering::Relaxed);
         let (modules, layouts, pipelines) = data.tracker.counts();
         tracing::info!(frames, modules, layouts, pipelines, "device destroyed");
+        ffi_guard("vkDestroyDevice", (), || data.stereo.destroy(&data.next));
         // SAFETY: the next layer's destroy with the handle it created.
         unsafe { (data.destroy)(data.handle, allocator) };
     }
+}
+
+/// A `GetProcAddr` result as the untyped pointer `ash` loads tables from.
+fn as_void(function: vk::PFN_vkVoidFunction) -> *const c_void {
+    function.map_or(std::ptr::null(), |f| f as *const c_void)
 }
 
 unsafe extern "system" fn queue_present(
     queue: vk::Queue,
     present_info: *const vk::PresentInfoKHR<'_>,
 ) -> vk::Result {
-    let next = ffi_guard("vkQueuePresentKHR", None, || {
+    let found = ffi_guard("vkQueuePresentKHR", None, || {
         // SAFETY: queues share their device's dispatch key.
         let data = dispatch::device(unsafe { key(queue) })?;
         let frame = data.count_frame();
         if frame == 1 || frame.is_multiple_of(FRAME_LOG_INTERVAL) {
             tracing::info!(frame, "presented");
         }
-        data.fns.queue_present
+        let next = data.fns.queue_present?;
+        Some((data, next, frame - 1))
     });
-    match next {
+    let Some((data, next, index)) = found else {
+        return vk::Result::ERROR_DEVICE_LOST;
+    };
+    // SAFETY: the application's present arguments.
+    let consumed = ffi_guard("vkQueuePresentKHR", false, || unsafe {
+        capture::on_present(&data, queue, &*present_info, index)
+    });
+    if consumed {
+        // The capture already waited on the semaphores and finished on this queue.
+        // SAFETY: a copy of the application's present info without the waits.
+        let info = unsafe { *present_info }.wait_semaphores(&[]);
+        // SAFETY: the next layer's present with that copy.
+        unsafe { next(queue, &info) }
+    } else {
         // SAFETY: the next layer's present with the application's arguments.
-        Some(present) => unsafe { present(queue, present_info) },
-        None => vk::Result::ERROR_DEVICE_LOST,
+        unsafe { next(queue, present_info) }
     }
 }

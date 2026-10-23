@@ -13,7 +13,7 @@ mod swapchain;
 use clap::ValueEnum;
 
 pub use context::validation_error_count;
-pub use renderer::Renderer;
+pub use renderer::{Readback, Renderer};
 
 /// How draws are wrapped, so the layer is exercised on both paths games use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

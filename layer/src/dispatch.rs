@@ -15,7 +15,8 @@ use std::{
 use ash::vk::{self, Handle};
 
 use crate::{
-    commands::CommandTracker, extensions::InstanceFns, hooks::DeviceFns, pipelines::Tracker,
+    capture::CaptureState, commands::CommandTracker, extensions::InstanceFns, hooks::DeviceFns,
+    pipelines::Tracker, stereo::StereoState,
 };
 
 pub type Key = usize;
@@ -37,6 +38,8 @@ pub struct InstanceData {
     pub next_get_instance_proc_addr: vk::PFN_vkGetInstanceProcAddr,
     pub destroy: vk::PFN_vkDestroyInstance,
     pub fns: InstanceFns,
+    /// The next layer's instance functions, for the layer's own calls.
+    pub next: ash::Instance,
     /// The process passed the opt-in gate.
     pub active: bool,
 }
@@ -46,10 +49,14 @@ pub struct DeviceData {
     pub next_get_device_proc_addr: vk::PFN_vkGetDeviceProcAddr,
     pub destroy: vk::PFN_vkDestroyDevice,
     pub fns: DeviceFns,
+    /// The next layer's device functions, for the layer's own calls.
+    pub next: ash::Device,
     pub active: bool,
     pub frames: AtomicU64,
     pub tracker: Tracker,
     pub commands: CommandTracker,
+    pub stereo: StereoState,
+    pub capture: CaptureState,
 }
 
 impl DeviceData {

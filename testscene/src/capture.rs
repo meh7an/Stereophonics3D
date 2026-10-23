@@ -4,11 +4,14 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use s3d_shared::capture::{
-    CameraRecord, CapturePaths, LightRecord, MarkerRecord, ProbeRecord, Sidecar, write_png,
-    write_sidecar,
+    CameraRecord, CapturePaths, LightRecord, MarkerRecord, ProbeRecord, Sidecar, write_depth,
+    write_png, write_sidecar,
 };
 
-use crate::scene::{CLEAR_COLOR, Scene};
+use crate::{
+    scene::{CLEAR_COLOR, Scene},
+    vulkan::Readback,
+};
 
 /// Ground truth for `scene` rendered at `size` through the `rendering` path.
 pub fn sidecar(scene: &Scene, size: (u32, u32), rendering: &str) -> Sidecar {
@@ -66,15 +69,17 @@ pub fn sidecar(scene: &Scene, size: (u32, u32), rendering: &str) -> Sidecar {
     }
 }
 
-/// Writes the mono image and sidecar of one frame into `dir` and returns the image path.
+/// Writes the mono image, depth dump and sidecar of one frame into `dir` and returns the
+/// image path.
 ///
 /// # Errors
 ///
-/// Returns an error when either file cannot be written.
-pub fn write(dir: &Path, rgba: &[u8], sidecar: &Sidecar) -> Result<PathBuf> {
+/// Returns an error when a file cannot be written.
+pub fn write(dir: &Path, readback: &Readback, sidecar: &Sidecar) -> Result<PathBuf> {
     let paths = CapturePaths::new(dir, &sidecar.scene, sidecar.frame);
     let image = paths.image(None);
-    write_png(&image, sidecar.width, sidecar.height, rgba)?;
+    write_png(&image, sidecar.width, sidecar.height, &readback.rgba)?;
+    write_depth(&paths.depth(), &readback.depth)?;
     write_sidecar(&paths.sidecar(), sidecar)?;
     Ok(image)
 }

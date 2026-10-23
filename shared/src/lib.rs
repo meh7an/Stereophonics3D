@@ -14,8 +14,8 @@ pub mod watch;
 
 pub use anaglyph::{AnaglyphMatrix, AnaglyphPreset, AnaglyphSettings, MatrixChoice};
 pub use config::{
-    AnaglyphOverrides, Config, DumpOverrides, DumpSettings, Profile, ShaderOverride,
-    StereoOverrides,
+    AnaglyphOverrides, CaptureSettings, Config, DumpOverrides, DumpSettings, Profile,
+    ShaderOverride, StereoOverrides,
 };
 pub use error::{Error, Result};
 pub use settings::{Diagnostic, Loader, Settings, Snapshot};

@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{AnaglyphSettings, MatrixChoice, ShaderHash, StereoParams};
+use crate::{AnaglyphSettings, Eye, MatrixChoice, ShaderHash, StereoParams};
 
 /// Global settings.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -18,6 +18,17 @@ pub struct Config {
     pub stereo: StereoParams,
     pub anaglyph: AnaglyphSettings,
     pub dump: DumpSettings,
+    pub capture: CaptureSettings,
+}
+
+/// Frames the layer captures from the swapchain, as `<exe>-f<frame>-<eye>.png` plus a
+/// sidecar, into `%LOCALAPPDATA%\Stereophonics3D\captures\<exe>\`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct CaptureSettings {
+    /// Presented frame to capture, counting from 0; absent captures nothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frame: Option<u32>,
 }
 
 /// Debug output written while a game runs.
@@ -40,6 +51,8 @@ pub struct Profile {
     pub anaglyph: AnaglyphOverrides,
     #[serde(default)]
     pub dump: DumpOverrides,
+    #[serde(default)]
+    pub capture: CaptureSettings,
     /// Per-shader behaviour keyed by `ShaderHash`; wins over automatic classification.
     #[serde(default)]
     pub shaders: BTreeMap<ShaderHash, ShaderOverride>,
@@ -55,6 +68,8 @@ pub struct StereoOverrides {
     pub convergence: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub swap_eyes: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub eye: Option<Eye>,
 }
 
 /// Anaglyph fields a profile may replace; `None` keeps the global value.
@@ -126,6 +141,7 @@ impl Config {
                     .unwrap_or(self.stereo.max_parallax_percent),
                 convergence: stereo.convergence.unwrap_or(self.stereo.convergence),
                 swap_eyes: stereo.swap_eyes.unwrap_or(self.stereo.swap_eyes),
+                eye: stereo.eye.or(self.stereo.eye),
             },
             anaglyph: AnaglyphSettings {
                 matrix: anaglyph.matrix.unwrap_or(self.anaglyph.matrix),
@@ -134,6 +150,9 @@ impl Config {
             },
             dump: DumpSettings {
                 shaders: profile.dump.shaders.unwrap_or(self.dump.shaders),
+            },
+            capture: CaptureSettings {
+                frame: profile.capture.frame.or(self.capture.frame),
             },
         }
     }
@@ -267,6 +286,7 @@ mod tests {
             dump: DumpOverrides {
                 shaders: Some(true),
             },
+            capture: CaptureSettings { frame: Some(120) },
             shaders: BTreeMap::from([
                 (hash("00000000000000aa"), ShaderOverride::Skip),
                 (hash("00000000000000bb"), ShaderOverride::HudDepth(1.5)),
@@ -371,6 +391,8 @@ mod tests {
         );
         assert_eq!(merged.anaglyph.gamma, config.anaglyph.gamma);
         assert!(merged.dump.shaders);
+        assert_eq!(merged.capture.frame, Some(120));
+        assert_eq!(merged.stereo.eye, None);
     }
 
     #[test]

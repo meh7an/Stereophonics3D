@@ -105,7 +105,7 @@ impl Swapchain {
             ctx,
             extent,
             DEPTH_FORMAT,
-            vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+            vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC,
             vk::ImageAspectFlags::DEPTH,
         )?;
         let render_finished = images

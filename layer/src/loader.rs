@@ -11,6 +11,13 @@ pub const NEGOTIATE_INTERFACE_STRUCT: u32 = 1;
 pub const INTERFACE_VERSION: u32 = 2;
 /// `VK_LAYER_LINK_INFO` in `VkLayerFunction`.
 const LAYER_LINK_INFO: u32 = 0;
+/// `VK_LOADER_DATA_CALLBACK` in `VkLayerFunction`.
+const LOADER_DATA_CALLBACK: u32 = 1;
+
+/// `PFN_vkSetDeviceLoaderData`: initialises the dispatch pointer of a dispatchable object
+/// the layer creates itself, such as a command buffer.
+pub type SetDeviceLoaderData =
+    unsafe extern "system" fn(device: vk::Device, object: *mut c_void) -> vk::Result;
 
 /// `PFN_GetPhysicalDeviceProcAddr`.
 pub type GetPhysicalDeviceProcAddr =
@@ -65,7 +72,7 @@ pub struct LayerDeviceLink {
 #[repr(C)]
 pub union LayerDeviceUnion {
     pub layer_info: *mut LayerDeviceLink,
-    set_device_loader_data: *const c_void,
+    pub set_device_loader_data: Option<SetDeviceLoaderData>,
 }
 
 /// `VkLayerDeviceCreateInfo`.
@@ -84,8 +91,14 @@ pub struct LayerDeviceCreateInfo {
 /// `next` must be a valid `pNext` chain of Vulkan structures.
 pub unsafe fn instance_link(next: *const c_void) -> Option<*mut LayerInstanceCreateInfo> {
     // SAFETY: forwarded from the caller.
-    unsafe { find_link(next, vk::StructureType::LOADER_INSTANCE_CREATE_INFO) }
-        .map(|base| base.cast::<LayerInstanceCreateInfo>())
+    unsafe {
+        find_link(
+            next,
+            vk::StructureType::LOADER_INSTANCE_CREATE_INFO,
+            LAYER_LINK_INFO,
+        )
+    }
+    .map(|base| base.cast::<LayerInstanceCreateInfo>())
 }
 
 /// The loader's link-info structure in a device create info's `pNext` chain.
@@ -95,18 +108,44 @@ pub unsafe fn instance_link(next: *const c_void) -> Option<*mut LayerInstanceCre
 /// `next` must be a valid `pNext` chain of Vulkan structures.
 pub unsafe fn device_link(next: *const c_void) -> Option<*mut LayerDeviceCreateInfo> {
     // SAFETY: forwarded from the caller.
-    unsafe { find_link(next, vk::StructureType::LOADER_DEVICE_CREATE_INFO) }
-        .map(|base| base.cast::<LayerDeviceCreateInfo>())
+    unsafe {
+        find_link(
+            next,
+            vk::StructureType::LOADER_DEVICE_CREATE_INFO,
+            LAYER_LINK_INFO,
+        )
+    }
+    .map(|base| base.cast::<LayerDeviceCreateInfo>())
 }
 
-/// Walks a `pNext` chain for a loader structure of `s_type` whose function is
-/// `VK_LAYER_LINK_INFO`. Both loader structures share the instance one's prefix.
+/// The loader's `vkSetDeviceLoaderData` from a device create info's `pNext` chain.
+///
+/// # Safety
+///
+/// `next` must be a valid `pNext` chain of Vulkan structures.
+pub unsafe fn device_loader_data(next: *const c_void) -> Option<SetDeviceLoaderData> {
+    // SAFETY: forwarded from the caller; the structure found is a device create info.
+    unsafe {
+        let found = find_link(
+            next,
+            vk::StructureType::LOADER_DEVICE_CREATE_INFO,
+            LOADER_DATA_CALLBACK,
+        )?;
+        (*found.cast::<LayerDeviceCreateInfo>())
+            .u
+            .set_device_loader_data
+    }
+}
+
+/// Walks a `pNext` chain for a loader structure of `s_type` whose `VkLayerFunction` is
+/// `function`. Both loader structures share the instance one's prefix.
 ///
 /// The loader hands the chain over as const but expects each layer to advance the link
 /// in place, hence the mutable pointer.
 unsafe fn find_link(
     mut next: *const c_void,
     s_type: vk::StructureType,
+    wanted: u32,
 ) -> Option<*mut LayerInstanceCreateInfo> {
     while !next.is_null() {
         let candidate = next.cast::<LayerInstanceCreateInfo>();
@@ -119,7 +158,7 @@ unsafe fn find_link(
                 (*candidate).p_next,
             )
         };
-        if found_type == s_type && function == LAYER_LINK_INFO {
+        if found_type == s_type && function == wanted {
             return Some(candidate.cast_mut());
         }
         next = following;

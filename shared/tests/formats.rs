@@ -2,7 +2,7 @@
 //! survive a serialize/parse round trip.
 
 use s3d_shared::{
-    AnaglyphPreset, Config, MatrixChoice, Profile, ShaderHash, ShaderOverride, StereoParams,
+    AnaglyphPreset, Config, Eye, MatrixChoice, Profile, ShaderHash, ShaderOverride, StereoParams,
 };
 
 const CONFIG: &str = include_str!("fixtures/config.toml");
@@ -30,6 +30,8 @@ fn test_profile_fixture_parses_every_override_kind() {
     assert_eq!(profile.stereo.convergence, Some(12.5));
     assert_eq!(profile.stereo.max_parallax_percent, None);
     assert_eq!(profile.dump.shaders, Some(true));
+    assert_eq!(profile.stereo.eye, Some(Eye::Right));
+    assert_eq!(profile.capture.frame, Some(300));
     assert_eq!(
         profile.anaglyph.matrix.map(MatrixChoice::matrix),
         Some(AnaglyphPreset::Color.matrix())

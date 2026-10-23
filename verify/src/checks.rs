@@ -106,7 +106,7 @@ pub struct Measurement {
 }
 
 impl Measurement {
-    fn within(subject: String, measured: f64, expected: f64, tolerance: f64) -> Self {
+    pub(crate) fn within(subject: String, measured: f64, expected: f64, tolerance: f64) -> Self {
         let ok = (measured - expected).abs() <= tolerance;
         Self {
             subject,
@@ -117,7 +117,7 @@ impl Measurement {
         }
     }
 
-    fn at_most(subject: String, measured: f64, limit: f64) -> Self {
+    pub(crate) fn at_most(subject: String, measured: f64, limit: f64) -> Self {
         Self {
             subject,
             measured,
@@ -127,7 +127,7 @@ impl Measurement {
         }
     }
 
-    fn check(subject: String, ok: bool, measured: f64, expected: f64) -> Self {
+    pub(crate) fn check(subject: String, ok: bool, measured: f64, expected: f64) -> Self {
         Self {
             subject,
             measured,

@@ -83,6 +83,17 @@ pub enum Error {
         found: String,
     },
 
+    /// A depth dump does not hold one float per pixel.
+    #[error("depth dump {path} has {found} bytes, expected {expected}")]
+    DepthSize {
+        /// File that failed.
+        path: PathBuf,
+        /// Bytes found.
+        found: usize,
+        /// Bytes a width x height dump holds.
+        expected: usize,
+    },
+
     /// Text is not 16 hex digits.
     #[error("invalid shader hash {text:?}; expected 16 hex digits")]
     InvalidShaderHash {

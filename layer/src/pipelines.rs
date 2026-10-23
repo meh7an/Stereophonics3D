@@ -1,19 +1,23 @@
 //! Shader modules, pipeline layouts, graphics pipelines and pipeline caches, tracked per
-//! device so every draw can be traced back to the shaders that produce it.
+//! device so every draw can be traced back to the shaders that produce it. Layouts get
+//! the stereo push-constant block appended and pipelines their last pre-raster stage
+//! patched (see `stereo`).
 
 use std::{
     collections::{HashMap, HashSet},
+    ffi::CStr,
     sync::{Arc, Mutex, PoisonError, RwLock},
 };
 
 use ash::vk;
-use s3d_shared::ShaderHash;
+use s3d_shared::{ShaderHash, ffi::ffi_guard};
 
 use crate::{
-    chain,
+    activation, chain,
     dispatch::{DeviceData, read, write},
     dump,
     hooks::next_device_fn,
+    stereo::{StereoRange, patch_options, shear_mode},
 };
 
 /// Pre-raster stages from last to first: the first one a pipeline has is the stage whose
@@ -28,23 +32,17 @@ const PRE_RASTER_LAST_FIRST: [vk::ShaderStageFlags; 4] = [
 #[derive(Debug)]
 pub struct ShaderModuleInfo {
     pub hash: ShaderHash,
+    /// Kept because the driver cannot hand it back, and patching happens later, at
+    /// pipeline creation.
+    pub code: Arc<[u32]>,
 }
 
 #[derive(Debug)]
 pub struct LayoutInfo {
-    /// The application's ranges; the layer's block is appended after them in M3.3.
-    pub push_constant_ranges: Vec<vk::PushConstantRange>,
-}
-
-impl LayoutInfo {
-    /// First byte after every application push constant.
-    pub fn push_constant_end(&self) -> u32 {
-        self.push_constant_ranges
-            .iter()
-            .map(|range| range.offset + range.size)
-            .max()
-            .unwrap_or(0)
-    }
+    /// The appended stereo block; `None` when the push budget had no room for it.
+    pub stereo: Option<StereoRange>,
+    /// The ranges the layout was created with, when they differ from the application's.
+    pub extended: Option<Vec<vk::PushConstantRange>>,
 }
 
 /// One shader stage of a pipeline.
@@ -60,6 +58,8 @@ pub struct StageShader {
 pub struct PipelineInfo {
     /// Own stages plus those of linked pipeline libraries.
     pub stages: Vec<StageShader>,
+    /// The block to push after each bind, when a stage was patched to read it.
+    pub stereo_push: Option<StereoRange>,
 }
 
 impl PipelineInfo {
@@ -158,11 +158,14 @@ pub unsafe extern "system" fn create_shader_module(
     // SAFETY: the next layer's create with the application's arguments.
     let result = unsafe { next(device, info, allocator, module) };
     if result == vk::Result::SUCCESS {
-        s3d_shared::ffi::ffi_guard("vkCreateShaderModule", (), || {
+        ffi_guard("vkCreateShaderModule", (), || {
             // SAFETY: a valid create info and the module just created from it.
             let ((hash, words), handle) = unsafe { (identify(&*info), *module) };
             dump::shader(hash, words);
-            let info = Arc::new(ShaderModuleInfo { hash });
+            let info = Arc::new(ShaderModuleInfo {
+                hash,
+                code: Arc::from(words),
+            });
             write(&data.tracker.modules).insert(handle, info);
         });
     }
@@ -180,7 +183,7 @@ pub unsafe extern "system" fn destroy_shader_module(
     let Some((data, next)) = found else {
         return;
     };
-    s3d_shared::ffi::ffi_guard("vkDestroyShaderModule", (), || {
+    ffi_guard("vkDestroyShaderModule", (), || {
         write(&data.tracker.modules).remove(&module);
     });
     // SAFETY: the next layer's destroy with the application's arguments.
@@ -202,31 +205,64 @@ pub unsafe extern "system" fn create_pipeline_layout(
     let Some((data, next)) = found else {
         return vk::Result::ERROR_INITIALIZATION_FAILED;
     };
-    // SAFETY: the next layer's create with the application's arguments.
-    let result = unsafe { next(device, info, allocator, layout) };
+    // SAFETY: a valid create info from the application.
+    let ranges = unsafe { push_ranges(&*info) };
+    let extended = ffi_guard("vkCreatePipelineLayout", None, || {
+        data.stereo.extend(&ranges)
+    });
+    let result = match &extended {
+        Some(extension) => {
+            // SAFETY: a copy of the application's create info with the extended ranges.
+            let info = unsafe { (*info).push_constant_ranges(&extension.ranges) };
+            // SAFETY: the next layer's create with the extended copy.
+            unsafe { next(device, &info, allocator, layout) }
+        }
+        // SAFETY: the next layer's create with the application's arguments.
+        None => unsafe { next(device, info, allocator, layout) },
+    };
     if result == vk::Result::SUCCESS {
-        s3d_shared::ffi::ffi_guard("vkCreatePipelineLayout", (), || {
-            // SAFETY: a valid create info and the layout just created from it.
-            let (ranges, handle) = unsafe {
-                let info = &*info;
-                let ranges = if info.p_push_constant_ranges.is_null() {
-                    Vec::new()
-                } else {
-                    std::slice::from_raw_parts(
-                        info.p_push_constant_ranges,
-                        info.push_constant_range_count as usize,
-                    )
-                    .to_vec()
-                };
-                (ranges, *layout)
-            };
-            let info = Arc::new(LayoutInfo {
-                push_constant_ranges: ranges,
+        ffi_guard("vkCreatePipelineLayout", (), || {
+            let stereo = extended.as_ref().and_then(|extension| {
+                match data.stereo.push_layout(&data.next, &extension.ranges) {
+                    Ok(push_layout) => Some(StereoRange {
+                        offset: extension.offset,
+                        stages: extension.push_stages,
+                        push_layout,
+                    }),
+                    Err(error) => {
+                        tracing::warn!(%error, "no push layout, specialization constants instead");
+                        None
+                    }
+                }
             });
-            write(&data.tracker.layouts).insert(handle, info);
+            let info = Arc::new(LayoutInfo {
+                stereo,
+                extended: extended.map(|extension| extension.ranges),
+            });
+            // SAFETY: the layout was just created.
+            write(&data.tracker.layouts).insert(unsafe { *layout }, info);
         });
     }
     result
+}
+
+/// The push-constant ranges of a layout create info.
+///
+/// # Safety
+///
+/// `info` must be a valid create info.
+unsafe fn push_ranges(info: &vk::PipelineLayoutCreateInfo<'_>) -> Vec<vk::PushConstantRange> {
+    if info.p_push_constant_ranges.is_null() {
+        return Vec::new();
+    }
+    // SAFETY: `push_constant_range_count` valid ranges.
+    unsafe {
+        std::slice::from_raw_parts(
+            info.p_push_constant_ranges,
+            info.push_constant_range_count as usize,
+        )
+    }
+    .to_vec()
 }
 
 pub unsafe extern "system" fn destroy_pipeline_layout(
@@ -243,7 +279,7 @@ pub unsafe extern "system" fn destroy_pipeline_layout(
     let Some((data, next)) = found else {
         return;
     };
-    s3d_shared::ffi::ffi_guard("vkDestroyPipelineLayout", (), || {
+    ffi_guard("vkDestroyPipelineLayout", (), || {
         write(&data.tracker.layouts).remove(&layout);
     });
     // SAFETY: the next layer's destroy with the application's arguments.
@@ -267,26 +303,125 @@ pub unsafe extern "system" fn create_graphics_pipelines(
     let Some((data, next)) = found else {
         return vk::Result::ERROR_INITIALIZATION_FAILED;
     };
-    // SAFETY: the next layer's create with the application's arguments.
-    let result = unsafe { next(device, cache, count, infos, allocator, pipelines) };
+    // SAFETY: `count` valid create infos.
+    let originals = unsafe { std::slice::from_raw_parts(infos, count as usize) };
+    let patches: Vec<Option<Patch>> = ffi_guard("vkCreateGraphicsPipelines", Vec::new(), || {
+        originals
+            .iter()
+            // SAFETY: each create info is valid.
+            .map(|info| unsafe { plan_patch(&data, info) })
+            .collect()
+    });
+    let patches = if patches.len() == originals.len() {
+        patches
+    } else {
+        vec![None; originals.len()]
+    };
+
+    // Copies of the create infos whose stage arrays point at the patched modules; the
+    // stage vectors must outlive the call.
+    let mut stages: Vec<Vec<vk::PipelineShaderStageCreateInfo<'_>>> = Vec::new();
+    let mut copies = originals.to_vec();
+    for (copy, patch) in copies.iter_mut().zip(&patches) {
+        if let Some(patch) = patch {
+            // SAFETY: `stage_count` valid stage infos.
+            let mut own =
+                unsafe { std::slice::from_raw_parts(copy.p_stages, copy.stage_count as usize) }
+                    .to_vec();
+            own[patch.stage].module = patch.module;
+            copy.p_stages = own.as_ptr();
+            stages.push(own);
+        }
+    }
+    let create_infos = if stages.is_empty() {
+        infos
+    } else {
+        copies.as_ptr()
+    };
+    // SAFETY: the next layer's create with the application's arguments, or copies that
+    // differ only in the patched modules.
+    let result = unsafe { next(device, cache, count, create_infos, allocator, pipelines) };
+    drop(stages);
+
     // Failures other than these leave every handle null; PIPELINE_COMPILE_REQUIRED leaves
     // some created, so record whatever is non-null.
-    s3d_shared::ffi::ffi_guard("vkCreateGraphicsPipelines", (), || {
-        // SAFETY: `count` valid create infos and as many output handles.
-        let (infos, handles) = unsafe {
-            (
-                std::slice::from_raw_parts(infos, count as usize),
-                std::slice::from_raw_parts(pipelines, count as usize),
-            )
-        };
-        for (info, &handle) in infos.iter().zip(handles) {
+    ffi_guard("vkCreateGraphicsPipelines", (), || {
+        // SAFETY: as many output handles as create infos.
+        let handles = unsafe { std::slice::from_raw_parts(pipelines, count as usize) };
+        for ((info, &handle), patch) in originals.iter().zip(handles).zip(&patches) {
             if handle != vk::Pipeline::null() {
+                let push = patch.as_ref().and_then(|patch| patch.push);
                 // SAFETY: a valid create info whose pipeline was created.
-                unsafe { record_pipeline(&data, info, handle) };
+                unsafe { record_pipeline(&data, info, handle, push) };
             }
         }
     });
     result
+}
+
+/// A pipeline's last pre-raster stage swapped for its patched module.
+#[derive(Debug, Clone, Copy)]
+struct Patch {
+    /// Index into the create info's stages.
+    stage: usize,
+    module: vk::ShaderModule,
+    /// The block to push, when the patch reads push constants.
+    push: Option<StereoRange>,
+}
+
+/// Decides how to patch one pipeline; `None` leaves it as the application built it.
+///
+/// # Safety
+///
+/// `info` must be a valid create info.
+unsafe fn plan_patch(
+    data: &DeviceData,
+    info: &vk::GraphicsPipelineCreateInfo<'_>,
+) -> Option<Patch> {
+    if info.p_stages.is_null() {
+        return None;
+    }
+    // SAFETY: the create info's chain is valid.
+    let libraries = unsafe {
+        chain::find(
+            info.p_next,
+            vk::StructureType::PIPELINE_LIBRARY_CREATE_INFO_KHR,
+        )
+    };
+    if libraries.is_some() {
+        tracing::debug!("pipeline linked from libraries left unpatched");
+        return None;
+    }
+    // SAFETY: `stage_count` valid stage infos.
+    let stages = unsafe { std::slice::from_raw_parts(info.p_stages, info.stage_count as usize) };
+    let index = PRE_RASTER_LAST_FIRST
+        .iter()
+        .find_map(|&wanted| stages.iter().position(|s| s.stage == wanted))?;
+    let stage = &stages[index];
+    if stage.module == vk::ShaderModule::null() {
+        tracing::debug!(stage = ?stage.stage, "inline shader code left unpatched");
+        return None;
+    }
+    let module = data.tracker.module(stage.module)?;
+    let snapshot = activation::get().snapshot()?;
+    let settings = snapshot.settings.as_ref()?;
+    let mode = shear_mode(settings.shaders.get(&module.hash))?;
+    let range = data
+        .tracker
+        .layout(info.layout)
+        .and_then(|layout| layout.stereo);
+    let current = settings.stereo.push_constants(settings.stereo.eye);
+    let options = patch_options(range.as_ref(), current, mode);
+    // SAFETY: the stage's entry-point name is nul-terminated.
+    let entry = unsafe { CStr::from_ptr(stage.p_name) }.to_str().ok()?;
+    let patched =
+        data.stereo
+            .patched_module(&data.next, module.hash, &module.code, entry, &options)?;
+    Some(Patch {
+        stage: index,
+        module: patched,
+        push: range,
+    })
 }
 
 /// Collects a new pipeline's stages, dumps inline code and names new pre-raster shaders.
@@ -298,9 +433,13 @@ unsafe fn record_pipeline(
     data: &DeviceData,
     info: &vk::GraphicsPipelineCreateInfo<'_>,
     handle: vk::Pipeline,
+    stereo_push: Option<StereoRange>,
 ) {
     let tracker = &data.tracker;
-    let mut pipeline = PipelineInfo::default();
+    let mut pipeline = PipelineInfo {
+        stereo_push,
+        ..PipelineInfo::default()
+    };
     if !info.p_stages.is_null() {
         // SAFETY: `stage_count` valid stage infos.
         let stages =
@@ -338,10 +477,7 @@ unsafe fn record_pipeline(
     {
         tracing::info!(%hash, ?stage, "pre-raster shader");
     }
-    let push_constant_end = tracker
-        .layout(info.layout)
-        .map(|layout| layout.push_constant_end());
-    tracing::debug!(?handle, stages = ?pipeline.stages, ?push_constant_end, "graphics pipeline");
+    tracing::debug!(?handle, stages = ?pipeline.stages, stereo = ?pipeline.stereo_push, "graphics pipeline");
     write(&tracker.pipelines).insert(handle, Arc::new(pipeline));
 }
 
@@ -387,7 +523,7 @@ pub unsafe extern "system" fn destroy_pipeline(
     let Some((data, next)) = found else {
         return;
     };
-    s3d_shared::ffi::ffi_guard("vkDestroyPipeline", (), || {
+    ffi_guard("vkDestroyPipeline", (), || {
         write(&data.tracker.pipelines).remove(&pipeline);
     });
     // SAFETY: the next layer's destroy with the application's arguments.
@@ -408,7 +544,7 @@ pub unsafe extern "system" fn create_pipeline_cache(
     };
     // Prebuilt cache contents only hold pipelines compiled from unpatched shaders, so
     // their size tells how much the game will compile again once patching starts.
-    s3d_shared::ffi::ffi_guard("vkCreatePipelineCache", (), || {
+    ffi_guard("vkCreatePipelineCache", (), || {
         // SAFETY: a valid create info.
         let initial_bytes = unsafe { (*info).initial_data_size };
         tracing::info!(initial_bytes, "pipeline cache created");
@@ -436,6 +572,7 @@ mod tests {
         let fragment = stage(vk::ShaderStageFlags::FRAGMENT, 4);
         let pipeline = |stages: &[StageShader]| PipelineInfo {
             stages: stages.to_vec(),
+            ..PipelineInfo::default()
         };
         assert_eq!(
             pipeline(&[vertex, fragment]).last_pre_raster(),

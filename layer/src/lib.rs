@@ -10,6 +10,7 @@
 mod macros;
 
 mod activation;
+mod capture;
 mod chain;
 mod commands;
 mod dispatch;
@@ -18,6 +19,7 @@ mod extensions;
 mod hooks;
 mod loader;
 mod pipelines;
+mod stereo;
 
 use std::ffi::c_char;
 

@@ -9,6 +9,7 @@ crate-type = ["cdylib"]
 [dependencies]
 ash = "0.38.0"
 s3d-shared = { version = "0.1.0", path = "../shared" }
+s3d-spirv-patch = { version = "0.1.0", path = "../spirv-patch" }
 s3d-spirv-val = { version = "0.1.0", path = "../spirv-val" }
 thiserror = "2.0.21"
 tracing = "0.1.44"

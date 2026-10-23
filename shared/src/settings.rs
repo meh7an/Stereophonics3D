@@ -14,8 +14,8 @@ use serde::de::DeserializeOwned;
 use toml::de::{DeTable, DeValue};
 
 use crate::{
-    AnaglyphSettings, Config, DumpSettings, Error, Profile, Result, ShaderHash, ShaderOverride,
-    StereoParams, config::Issue,
+    AnaglyphSettings, CaptureSettings, Config, DumpSettings, Error, Profile, Result, ShaderHash,
+    ShaderOverride, StereoParams, config::Issue,
 };
 
 const CONFIG_FILE: &str = "config.toml";
@@ -47,6 +47,21 @@ pub fn default_dump_dir() -> Result<PathBuf> {
     }
     std::env::var_os("LOCALAPPDATA")
         .map(|base| PathBuf::from(base).join("Stereophonics3D").join("dumps"))
+        .ok_or(Error::NoLocalAppData)
+}
+
+/// `%LOCALAPPDATA%\Stereophonics3D\captures`, or the directory in `S3D_CAPTURE_DIR` when
+/// set.
+///
+/// # Errors
+///
+/// Returns [`Error::NoLocalAppData`] when neither variable is set.
+pub fn default_capture_dir() -> Result<PathBuf> {
+    if let Some(dir) = std::env::var_os(crate::layer::CAPTURE_DIR_ENV) {
+        return Ok(PathBuf::from(dir));
+    }
+    std::env::var_os("LOCALAPPDATA")
+        .map(|base| PathBuf::from(base).join("Stereophonics3D").join("captures"))
         .ok_or(Error::NoLocalAppData)
 }
 
@@ -86,6 +101,7 @@ pub struct Settings {
     pub stereo: StereoParams,
     pub anaglyph: AnaglyphSettings,
     pub dump: DumpSettings,
+    pub capture: CaptureSettings,
     pub shaders: BTreeMap<ShaderHash, ShaderOverride>,
     /// Profile file the settings came from.
     pub profile: PathBuf,
@@ -178,6 +194,7 @@ impl Loader {
                 stereo: merged.stereo,
                 anaglyph: merged.anaglyph,
                 dump: merged.dump,
+                capture: merged.capture,
                 shaders: profile.shaders.clone(),
                 profile: (*path).clone(),
             }

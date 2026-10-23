@@ -55,6 +55,9 @@ pub struct StereoParams {
     pub convergence: f32,
     /// Exchange the eyes, for glasses worn the other way round.
     pub swap_eyes: bool,
+    /// Single-eye mode: the whole frame renders as this eye. Absent renders mono.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub eye: Option<Eye>,
 }
 
 impl Default for StereoParams {
@@ -66,6 +69,7 @@ impl Default for StereoParams {
             max_parallax_percent: 3.0,
             convergence: 4.0,
             swap_eyes: false,
+            eye: None,
         }
     }
 }
@@ -208,6 +212,7 @@ mod tests {
             max_parallax_percent: 2.5,
             convergence: 7.0,
             swap_eyes: true,
+            eye: Some(Eye::Left),
         };
         let text = toml::to_string(&params).expect("serialize");
         assert_eq!(

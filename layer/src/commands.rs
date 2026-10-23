@@ -1,8 +1,9 @@
-//! Command-buffer tracking and draw skipping.
+//! Command-buffer tracking, draw skipping and the stereo constants.
 //!
 //! Binding a graphics pipeline decides, against the current profile, whether the draws
 //! that follow are dropped: a profile `skip` entry matching any of the pipeline's shaders
-//! hides those draws. Deciding at bind time means a hot-reloaded profile applies to the
+//! hides those draws. A pipeline with a patched stage also gets the stereo block pushed
+//! right after the bind. Deciding at bind time means a hot-reloaded profile applies to the
 //! next recording without recreating pipelines.
 
 use std::{
@@ -14,12 +15,16 @@ use std::{
 };
 
 use ash::vk;
-use s3d_shared::{ShaderHash, ShaderOverride, ffi::ffi_guard};
+use s3d_shared::{
+    Settings, ShaderHash, ShaderOverride, StereoParams, StereoPushConstants, ffi::ffi_guard,
+};
 
 use crate::{
     activation,
     dispatch::{self, DeviceData, key, read, write},
     hooks::{DeviceFns, next_device_fn},
+    pipelines::PipelineInfo,
+    stereo::{StereoRange, push_segments},
 };
 
 /// Command buffers whose bound graphics pipeline is skipped.
@@ -70,14 +75,8 @@ fn skipped_by<'a>(
         .find(|hash| matches!(overrides(hash), Some(ShaderOverride::Skip)))
 }
 
-/// Whether draws with `pipeline` bound are dropped under the current profile.
-fn skips_pipeline(data: &DeviceData, pipeline: vk::Pipeline) -> bool {
-    let Some(snapshot) = activation::get().snapshot() else {
-        return false;
-    };
-    let Some(settings) = &snapshot.settings else {
-        return false;
-    };
+/// Whether draws with `info`'s pipeline bound are dropped under `settings`.
+fn skips_pipeline(data: &DeviceData, info: &PipelineInfo, settings: &Settings) -> bool {
     if !settings
         .shaders
         .values()
@@ -85,9 +84,6 @@ fn skips_pipeline(data: &DeviceData, pipeline: vk::Pipeline) -> bool {
     {
         return false;
     }
-    let Some(info) = data.tracker.pipeline(pipeline) else {
-        return false;
-    };
     let Some(hash) = skipped_by(info.hashes(), |hash| settings.shaders.get(hash)) else {
         return false;
     };
@@ -108,14 +104,102 @@ pub unsafe extern "system" fn cmd_bind_pipeline(
     let Some((data, next)) = found else {
         return;
     };
-    if bind_point == vk::PipelineBindPoint::GRAPHICS {
-        ffi_guard("vkCmdBindPipeline", (), || {
-            data.commands
-                .set(command_buffer, skips_pipeline(&data, pipeline));
-        });
-    }
+    let push = if bind_point == vk::PipelineBindPoint::GRAPHICS {
+        ffi_guard("vkCmdBindPipeline", None, || {
+            bind_graphics(&data, command_buffer, pipeline)
+        })
+    } else {
+        None
+    };
     // SAFETY: the next layer's bind with the application's arguments.
     unsafe { next(command_buffer, bind_point, pipeline) };
+    if let Some((range, block)) = push {
+        // SAFETY: the layer's own push layout matches the range, and the command buffer
+        // is recording since the application just bound a pipeline into it.
+        unsafe {
+            data.next.cmd_push_constants(
+                command_buffer,
+                range.push_layout,
+                range.stages,
+                range.offset,
+                &block.to_bytes(),
+            );
+        }
+    }
+}
+
+/// Records the skip decision for a graphics bind and returns the stereo block to push
+/// after it, if the pipeline reads one.
+fn bind_graphics(
+    data: &DeviceData,
+    command_buffer: vk::CommandBuffer,
+    pipeline: vk::Pipeline,
+) -> Option<(StereoRange, StereoPushConstants)> {
+    let snapshot = activation::get().snapshot();
+    let settings = snapshot.as_ref().and_then(|s| s.settings.as_ref());
+    let Some(info) = data.tracker.pipeline(pipeline) else {
+        data.commands.set(command_buffer, false);
+        return None;
+    };
+    let skip = settings.is_some_and(|settings| skips_pipeline(data, &info, settings));
+    data.commands.set(command_buffer, skip);
+    let range = info.stereo_push?;
+    // Without a matching profile any more, the shear degenerates to mono.
+    let block = settings.map_or_else(
+        || StereoParams::default().push_constants(None),
+        |settings| settings.stereo.push_constants(settings.stereo.eye),
+    );
+    Some((range, block))
+}
+
+/// Forwards the application's push, split and widened where the layout's ranges were
+/// extended to hold the stereo block.
+pub unsafe extern "system" fn cmd_push_constants(
+    command_buffer: vk::CommandBuffer,
+    layout: vk::PipelineLayout,
+    stages: vk::ShaderStageFlags,
+    offset: u32,
+    size: u32,
+    values: *const std::ffi::c_void,
+) {
+    // SAFETY: a live command buffer from the application.
+    let found = unsafe {
+        next_device_fn("vkCmdPushConstants", command_buffer, |f| {
+            f.cmd_push_constants
+        })
+    };
+    let Some((data, next)) = found else {
+        return;
+    };
+    let segments = ffi_guard("vkCmdPushConstants", None, || {
+        let info = data.tracker.layout(layout)?;
+        let ranges = info.extended.as_ref()?;
+        Some(push_segments(ranges, stages, offset, size))
+    });
+    match segments.as_deref() {
+        Some([(widened, ..)]) if *widened == stages => {}
+        Some(segments) if !segments.is_empty() => {
+            for &(segment_stages, segment_offset, segment_size) in segments {
+                // SAFETY: the application's bytes for this segment of its push.
+                let bytes = unsafe { values.cast::<u8>().add((segment_offset - offset) as usize) };
+                // SAFETY: the next layer's push of part of the application's values.
+                unsafe {
+                    next(
+                        command_buffer,
+                        layout,
+                        segment_stages,
+                        segment_offset,
+                        segment_size,
+                        bytes.cast(),
+                    );
+                }
+            }
+            return;
+        }
+        _ => {}
+    }
+    // SAFETY: the next layer's push with the application's arguments.
+    unsafe { next(command_buffer, layout, stages, offset, size, values) };
 }
 
 pub unsafe extern "system" fn begin_command_buffer(
