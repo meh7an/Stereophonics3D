@@ -2,7 +2,7 @@
 
 use std::{env, path::PathBuf, process::Command};
 
-const SHADERS: &[&str] = &["fullscreen.vert", "identity.frag"];
+const SHADERS: &[&str] = &["fullscreen.vert", "identity.frag", "text.vert", "text.frag"];
 
 fn main() {
     let sdk = env::var_os("VULKAN_SDK")

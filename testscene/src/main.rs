@@ -5,6 +5,7 @@
 //! of by eye.
 
 mod capture;
+mod keys;
 mod scene;
 mod vulkan;
 
@@ -71,6 +72,12 @@ struct Args {
     /// `<frame>:<width>x<height>`, e.g. `30:960x540`.
     #[arg(long, value_parser = parse_resize)]
     resize: Option<Resize>,
+
+    /// Hold a key combination down while a frame renders and presents, through
+    /// `SendInput`: `<frame>:<keys>`, e.g. `30:Ctrl+F4`; repeatable. The window takes focus
+    /// at start-up, so use frames from about 10 on.
+    #[arg(long, value_parser = keys::parse_press)]
+    press: Vec<keys::Press>,
 }
 
 /// A scripted window resize.
@@ -158,6 +165,12 @@ impl App {
         if self.args.list_device_extensions {
             renderer.print_device_report()?;
         }
+        // The layer ignores keys while another window has focus. Focusing simulates an
+        // Alt press, so it happens here, long before the first scripted press, where a
+        // still-registering Alt would break the press's exact modifiers.
+        if !self.args.press.is_empty() {
+            window.focus_window();
+        }
         window.request_redraw();
         self.renderer = Some(renderer);
         self.window = Some(window);
@@ -186,9 +199,25 @@ impl App {
         Ok(())
     }
 
+    /// Releases the keys pressed for the previous frame, then presses this frame's.
+    fn press_keys(&self) -> Result<()> {
+        for press in &self.args.press {
+            if press.frame + 1 == self.frame {
+                keys::up(press.combo)?;
+            }
+        }
+        for press in &self.args.press {
+            if press.frame == self.frame {
+                keys::down(press.combo)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Renders one frame and reports whether the run is complete.
     fn step(&mut self) -> Result<bool> {
         self.resize_if_due()?;
+        self.press_keys()?;
         let scene = self.scene(self.frame);
         let size = (self.extent.width, self.extent.height);
         let Some(renderer) = self.renderer.as_mut() else {
@@ -218,6 +247,13 @@ impl App {
 
     /// Releases GPU resources, then turns the run's outcome into the exit status.
     fn finish(mut self) -> Result<()> {
+        // A press on the last frame (or one interrupted by an error) is still held, and
+        // would stay held for the whole desktop.
+        for press in &self.args.press {
+            if press.frame + 1 >= self.frame {
+                let _ = keys::up(press.combo);
+            }
+        }
         self.renderer = None;
         if let Some(error) = self.failure {
             return Err(error);

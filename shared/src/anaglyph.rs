@@ -46,6 +46,24 @@ impl AnaglyphPreset {
         Self::Gray,
     ];
 
+    /// The name the preset has in TOML.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Dubois2001 => "dubois-2001",
+            Self::Dubois2009 => "dubois-2009",
+            Self::ZhangLcd => "zhang-lcd",
+            Self::Color => "color",
+            Self::HalfColor => "half-color",
+            Self::Gray => "gray",
+        }
+    }
+
+    /// The preset after this one in [`AnaglyphPreset::ALL`], wrapping around.
+    pub fn next(self) -> Self {
+        let index = Self::ALL.iter().position(|&p| p == self).unwrap_or(0);
+        Self::ALL[(index + 1) % Self::ALL.len()]
+    }
+
     pub fn matrix(self) -> AnaglyphMatrix {
         let [ly, cy, by] = LUMA;
         AnaglyphMatrix(match self {
@@ -208,7 +226,18 @@ mod tests {
             })
             .expect("serialize");
             assert_eq!(text.trim(), format!("matrix = \"{name}\""), "{preset:?}");
+            assert_eq!(preset.name(), name);
         }
+    }
+
+    #[test]
+    fn test_next_cycles_through_every_preset() {
+        let mut preset = AnaglyphPreset::Dubois2001;
+        for expected in AnaglyphPreset::ALL.into_iter().skip(1) {
+            preset = preset.next();
+            assert_eq!(preset, expected);
+        }
+        assert_eq!(preset.next(), AnaglyphPreset::Dubois2001);
     }
 
     #[test]

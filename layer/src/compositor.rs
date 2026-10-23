@@ -19,7 +19,10 @@ use std::{
 
 use ash::vk::{self, Handle};
 
-use crate::{chain, loader::SetDeviceLoaderData, swapchain::DeviceContext};
+use crate::{
+    chain, loader::SetDeviceLoaderData, overlay::TextPass, present::Ticket, readout::Cell,
+    swapchain::DeviceContext,
+};
 
 const VERTEX_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fullscreen.vert.spv"));
 const FRAGMENT_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/identity.frag.spv"));
@@ -77,6 +80,10 @@ pub struct Compositor {
     queries: vk::QueryPool,
     /// Per image: a timed composite was submitted, so its timestamps can be read.
     measured: Vec<AtomicBool>,
+    /// The readout, drawn over the image.
+    text: Option<TextPass>,
+    /// Per image: the submission of its latest composite.
+    submissions: Mutex<Vec<Option<Ticket>>>,
     recorded: Mutex<HashMap<u32, Recorded>>,
 }
 
@@ -112,6 +119,8 @@ impl Compositor {
             finished: Vec::new(),
             queries: vk::QueryPool::null(),
             measured: real_images.iter().map(|_| AtomicBool::new(false)).collect(),
+            text: None,
+            submissions: Mutex::new(vec![None; real_images.len()]),
             recorded: Mutex::new(HashMap::new()),
         };
         // SAFETY: forwarded from the caller.
@@ -185,9 +194,28 @@ impl Compositor {
                 &vk::PipelineLayoutCreateInfo::default().set_layouts(&set_layouts),
                 None,
             )?;
-            self.pipeline =
-                create_pipeline(device, self.pipeline_layout, self.render_pass, self.extent)?;
+            let blend = vk::PipelineColorBlendAttachmentState::default()
+                .color_write_mask(vk::ColorComponentFlags::RGBA);
+            self.pipeline = create_pipeline(
+                device,
+                self.pipeline_layout,
+                self.render_pass,
+                self.extent,
+                &PipelineSpec {
+                    vertex: VERTEX_SHADER,
+                    fragment: FRAGMENT_SHADER,
+                    vertex_input: vk::PipelineVertexInputStateCreateInfo::default(),
+                    blend,
+                },
+            )?;
             self.create_sets(device)?;
+            self.text = Some(TextPass::new(
+                device,
+                context,
+                self.render_pass,
+                self.extent,
+                real_images.len(),
+            )?);
             for _ in real_images {
                 let semaphore =
                     device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None)?;
@@ -444,6 +472,9 @@ impl Compositor {
                 &[],
             );
             device.cmd_draw(command_buffer, 3, 1, 0, 0);
+            if let Some(text) = &self.text {
+                text.record(device, command_buffer, index);
+            }
             device.cmd_end_render_pass(command_buffer);
             device.cmd_pipeline_barrier(
                 command_buffer,
@@ -466,9 +497,39 @@ impl Compositor {
         }
     }
 
-    /// Marks image `index`'s composite as submitted with timestamps.
-    pub fn submitted_timed(&self, index: usize) {
-        self.measured[index].store(true, Ordering::Relaxed);
+    /// Records the submission holding image `index`'s latest composite.
+    pub fn submitted(&self, index: usize, ticket: Ticket, timed: bool) {
+        self.submissions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)[index] = Some(ticket);
+        if timed {
+            self.measured[index].store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Makes image `index` show `cells` over the image from its next composite on;
+    /// `wait_for` is called with the image's latest submission before its buffer is
+    /// rewritten and must return only once that submission has finished.
+    ///
+    /// # Safety
+    ///
+    /// `index` must be an image index of this swapchain.
+    pub unsafe fn show(&self, index: usize, cells: &[Cell], wait_for: impl FnOnce(Ticket)) {
+        let Some(text) = &self.text else {
+            return;
+        };
+        let last = self
+            .submissions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)[index];
+        // SAFETY: forwarded from the caller; `wait_for` covers the only GPU reader.
+        unsafe {
+            text.update(index, cells, || {
+                if let Some(ticket) = last {
+                    wait_for(ticket);
+                }
+            });
+        }
     }
 
     /// GPU nanoseconds of image `index`'s previous timed composite, if it is known.
@@ -522,6 +583,9 @@ impl Compositor {
         unsafe {
             for recorded in recorded.into_values() {
                 device.destroy_command_pool(recorded.pool, None);
+            }
+            if let Some(text) = &self.text {
+                text.destroy(device);
             }
             device.destroy_query_pool(self.queries, None);
             for &semaphore in &self.finished {
@@ -736,19 +800,30 @@ unsafe fn create_render_pass(
     }
 }
 
-/// The fullscreen-triangle pipeline with a fixed viewport over the whole swapchain.
+/// What differs between the compositor's pipelines.
+pub struct PipelineSpec<'a> {
+    /// SPIR-V bytes of the vertex and fragment shaders.
+    pub vertex: &'a [u8],
+    pub fragment: &'a [u8],
+    pub vertex_input: vk::PipelineVertexInputStateCreateInfo<'a>,
+    pub blend: vk::PipelineColorBlendAttachmentState,
+}
+
+/// A triangle-list pipeline for subpass 0 of `render_pass` with a fixed viewport over the
+/// whole swapchain.
 ///
 /// # Safety
 ///
 /// `layout` and `render_pass` must be live objects of `device`.
-unsafe fn create_pipeline(
+pub unsafe fn create_pipeline(
     device: &ash::Device,
     layout: vk::PipelineLayout,
     render_pass: vk::RenderPass,
     extent: vk::Extent2D,
+    spec: &PipelineSpec<'_>,
 ) -> Result<vk::Pipeline, CompositorError> {
-    let vertex_code = ash::util::read_spv(&mut Cursor::new(VERTEX_SHADER))?;
-    let fragment_code = ash::util::read_spv(&mut Cursor::new(FRAGMENT_SHADER))?;
+    let vertex_code = ash::util::read_spv(&mut Cursor::new(spec.vertex))?;
+    let fragment_code = ash::util::read_spv(&mut Cursor::new(spec.fragment))?;
     // SAFETY: forwarded from the caller; the modules are destroyed once the pipeline
     // holds its own copy of the code.
     unsafe {
@@ -777,7 +852,6 @@ unsafe fn create_pipeline(
                 .module(fragment)
                 .name(c"main"),
         ];
-        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
         let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
             .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
         let viewports = [vk::Viewport::default()
@@ -794,13 +868,12 @@ unsafe fn create_pipeline(
             .line_width(1.0);
         let multisample = vk::PipelineMultisampleStateCreateInfo::default()
             .rasterization_samples(vk::SampleCountFlags::TYPE_1);
-        let blend_attachments = [vk::PipelineColorBlendAttachmentState::default()
-            .color_write_mask(vk::ColorComponentFlags::RGBA)];
+        let blend_attachments = [spec.blend];
         let blend =
             vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attachments);
         let info = vk::GraphicsPipelineCreateInfo::default()
             .stages(&stages)
-            .vertex_input_state(&vertex_input)
+            .vertex_input_state(&spec.vertex_input)
             .input_assembly_state(&input_assembly)
             .viewport_state(&viewport)
             .rasterization_state(&rasterization)

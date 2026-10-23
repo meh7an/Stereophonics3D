@@ -27,3 +27,23 @@ shaders = false
 # Presented frame (counting from 0) the layer saves per eye to
 # %LOCALAPPDATA%\Stereophonics3D\captures\<exe>\. Absent captures nothing.
 # frame = 60
+
+[hotkeys]
+# Modifiers (Ctrl, Alt, Shift) plus one key: A-Z, 0-9, F1-F24, Num0-Num9, Space, Insert,
+# Delete, Home, End, PageUp, PageDown, Up, Down, Left, Right, Tab, Pause, Plus, Minus,
+# Comma, Period. Changes made with these keys last until saved or until a file reloads.
+toggle = "Ctrl+T"
+parallax_down = "Ctrl+F3"
+parallax_up = "Ctrl+F4"
+convergence_down = "Ctrl+F5"
+convergence_up = "Ctrl+F6"
+swap_eyes = "Ctrl+F7"
+cycle_matrix = "Ctrl+F8"
+# Writes parallax, convergence, swap_eyes and matrix into the game's profile.
+save = "Ctrl+F11"
+
+[readout]
+# "auto" shows the readout for `seconds` after a change and while a file has errors;
+# "always" or "off".
+mode = "auto"
+seconds = 3.0

@@ -20,7 +20,7 @@ use s3d_shared::{
 };
 
 use crate::{
-    activation,
+    activation, controls,
     dispatch::{self, DeviceData, key, read, write},
     hooks::{DeviceFns, next_device_fn},
     pipelines::PipelineInfo,
@@ -147,7 +147,7 @@ fn bind_graphics(
     // Without a matching profile any more, the shear degenerates to mono.
     let block = settings.map_or_else(
         || StereoParams::default().push_constants(None),
-        |settings| settings.stereo.push_constants(settings.stereo.eye),
+        |settings| controls::push_constants(settings, data.frames.load(Ordering::Relaxed)),
     );
     Some((range, block))
 }

@@ -12,10 +12,13 @@ use std::{
 
 use serde::de::DeserializeOwned;
 use toml::de::{DeTable, DeValue};
+use toml_edit::{DocumentMut, Item};
 
 use crate::{
-    AnaglyphSettings, CaptureSettings, Config, DumpSettings, Error, Profile, Result, ShaderHash,
-    ShaderOverride, StereoParams, config::Issue,
+    AnaglyphSettings, CaptureSettings, Config, DumpSettings, Error, MatrixChoice, Profile, Result,
+    ShaderHash, ShaderOverride, StereoParams,
+    config::Issue,
+    hotkeys::{HotkeySettings, ReadoutSettings},
 };
 
 const CONFIG_FILE: &str = "config.toml";
@@ -102,6 +105,8 @@ pub struct Settings {
     pub anaglyph: AnaglyphSettings,
     pub dump: DumpSettings,
     pub capture: CaptureSettings,
+    pub hotkeys: HotkeySettings,
+    pub readout: ReadoutSettings,
     pub shaders: BTreeMap<ShaderHash, ShaderOverride>,
     /// Profile file the settings came from.
     pub profile: PathBuf,
@@ -195,6 +200,8 @@ impl Loader {
                 anaglyph: merged.anaglyph,
                 dump: merged.dump,
                 capture: merged.capture,
+                hotkeys: merged.hotkeys,
+                readout: merged.readout,
                 shaders: profile.shaders.clone(),
                 profile: (*path).clone(),
             }
@@ -207,6 +214,90 @@ impl Loader {
             generation: self.generation,
         }
     }
+}
+
+/// Values the injector writes back into a profile; `None` leaves the key as it is.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ProfileUpdate {
+    pub max_parallax_percent: Option<f32>,
+    pub convergence: Option<f32>,
+    pub swap_eyes: Option<bool>,
+    pub matrix: Option<MatrixChoice>,
+}
+
+/// Writes `update` into the profile at `path`, editing only the keys it sets so comments,
+/// ordering and every other entry survive. The result is checked to parse as a valid
+/// profile before the file is replaced.
+///
+/// # Errors
+///
+/// The file cannot be read or written, is not valid TOML, or would not be a valid profile
+/// afterwards.
+pub fn save_profile(path: &Path, update: &ProfileUpdate) -> Result<()> {
+    let io = |source| Error::Io {
+        path: path.to_path_buf(),
+        source,
+    };
+    let edit_error = |message: String| Error::ProfileEdit {
+        path: path.to_path_buf(),
+        message,
+    };
+    let text = fs::read_to_string(path).map_err(io)?;
+    let mut document: DocumentMut = text
+        .parse()
+        .map_err(|error| edit_error(format!("{error}")))?;
+    let fields = [
+        (
+            "stereo",
+            "max_parallax_percent",
+            update.max_parallax_percent.map(item),
+        ),
+        ("stereo", "convergence", update.convergence.map(item)),
+        ("stereo", "swap_eyes", update.swap_eyes.map(item)),
+        ("anaglyph", "matrix", update.matrix.map(item)),
+    ];
+    for (table, key, value) in fields {
+        let Some(value) = value else {
+            continue;
+        };
+        let value = value.map_err(edit_error)?;
+        let table = document
+            .entry(table)
+            .or_insert_with(|| Item::Table(toml_edit::Table::new()))
+            .as_table_like_mut()
+            .ok_or_else(|| edit_error(format!("`{table}` is not a table")))?;
+        match (table.get_mut(key), value) {
+            // Replacing only the value keeps the key, and with it the comment lines above.
+            (Some(Item::Value(old)), Item::Value(mut new)) => {
+                *new.decor_mut() = old.decor().clone();
+                *old = new;
+            }
+            (_, value) => {
+                table.insert(key, value);
+            }
+        }
+    }
+    let edited = document.to_string();
+    let profile: Profile =
+        toml::from_str(&edited).map_err(|error| edit_error(error.to_string()))?;
+    if let Some(issue) = profile.validate().into_iter().next() {
+        return Err(edit_error(format!("{}: {}", issue.field, issue.message)));
+    }
+    fs::write(path, edited).map_err(io)
+}
+
+/// `value` as a TOML item, written the way serde writes it in a whole file (preset names,
+/// matrix rows, shortest float form).
+fn item<T: serde::Serialize>(value: T) -> std::result::Result<Item, String> {
+    #[derive(serde::Serialize)]
+    struct Wrapper<T> {
+        value: T,
+    }
+    let text = toml::to_string(&Wrapper { value }).map_err(|error| error.to_string())?;
+    let mut document: DocumentMut = text.parse().map_err(|error| format!("{error}"))?;
+    document
+        .remove("value")
+        .ok_or_else(|| "serialized value is missing".to_owned())
 }
 
 /// `*.toml` files directly inside `dir`, sorted, so "first file wins" is deterministic.
@@ -456,5 +547,69 @@ mod tests {
             "executable = \"a.exe\"\n\n[shaders]\n\"00000000000000AA\" = { hud_depth = 0.0 }\n";
         assert_eq!(field_line(text, "shaders.00000000000000aa"), Some(4));
         assert_eq!(field_line(text, "stereo.convergence"), None);
+    }
+
+    const COMMENTED_PROFILE: &str = "# My game\nexecutable = \"Game.exe\"\n\n[stereo]\n\
+        # tuned by hand\nconvergence = 5.0\neye = \"left\"\n\n[shaders]\n\
+        \"00000000000000aa\" = \"sky\"\n";
+
+    #[test]
+    fn test_save_profile_round_trips_and_keeps_comments_and_entries() {
+        let (dir, mut loader) = setup();
+        let path = write(dir.path(), "profiles/game.toml", COMMENTED_PROFILE);
+        let update = ProfileUpdate {
+            max_parallax_percent: Some(3.25),
+            convergence: Some(4.2),
+            swap_eyes: Some(true),
+            matrix: Some(MatrixChoice::Preset(crate::AnaglyphPreset::ZhangLcd)),
+        };
+        save_profile(&path, &update).expect("save");
+        let text = fs::read_to_string(&path).expect("read");
+        assert!(
+            text.contains("# My game") && text.contains("# tuned by hand"),
+            "{text}"
+        );
+        assert!(text.contains("convergence = 4.2\n"), "{text}");
+        assert!(text.contains("matrix = \"zhang-lcd\""), "{text}");
+
+        let settings = loader.load().settings.expect("profile still matches");
+        assert_eq!(settings.stereo.max_parallax_percent, 3.25);
+        assert_eq!(settings.stereo.convergence, 4.2);
+        assert!(settings.stereo.swap_eyes);
+        assert_eq!(settings.stereo.eye, Some(crate::Eye::Left));
+        assert_eq!(update.matrix, Some(settings.anaglyph.matrix));
+        assert_eq!(settings.shaders.len(), 1);
+    }
+
+    #[test]
+    fn test_save_profile_writes_custom_matrix_and_skips_unset_fields() {
+        let (dir, mut loader) = setup();
+        let path = write(dir.path(), "profiles/game.toml", COMMENTED_PROFILE);
+        let matrix = crate::AnaglyphPreset::Gray.matrix();
+        let update = ProfileUpdate {
+            matrix: Some(MatrixChoice::Custom(matrix)),
+            ..ProfileUpdate::default()
+        };
+        save_profile(&path, &update).expect("save");
+        let settings = loader.load().settings.expect("profile still matches");
+        assert_eq!(settings.anaglyph.matrix, MatrixChoice::Custom(matrix));
+        assert_eq!(settings.stereo.convergence, 5.0);
+        assert_eq!(
+            settings.stereo.max_parallax_percent,
+            StereoParams::default().max_parallax_percent
+        );
+    }
+
+    #[test]
+    fn test_save_profile_refuses_invalid_values_and_leaves_file_unchanged() {
+        let (dir, _) = setup();
+        let path = write(dir.path(), "profiles/game.toml", COMMENTED_PROFILE);
+        let update = ProfileUpdate {
+            convergence: Some(-1.0),
+            ..ProfileUpdate::default()
+        };
+        let error = save_profile(&path, &update).expect_err("negative convergence");
+        assert!(matches!(error, Error::ProfileEdit { .. }), "{error}");
+        assert_eq!(fs::read_to_string(&path).expect("read"), COMMENTED_PROFILE);
     }
 }

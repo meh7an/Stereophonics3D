@@ -13,7 +13,7 @@ use ash::vk::{self, Handle};
 use s3d_shared::ffi::ffi_guard;
 
 use crate::{
-    activation, commands,
+    activation, commands, controls,
     dispatch::{self, DeviceData, InstanceData, key},
     extensions::{self, InstanceFns},
     loader, pipelines, present,
@@ -456,6 +456,7 @@ unsafe extern "system" fn queue_present(
     let Some((data, next, index)) = found else {
         return vk::Result::ERROR_DEVICE_LOST;
     };
+    ffi_guard("vkQueuePresentKHR", (), || controls::poll(index));
     // SAFETY: the application's present arguments, on the queue it synchronises.
     let waits = ffi_guard("vkQueuePresentKHR", None, || unsafe {
         present::prepare(&data, queue, &*present_info, index)

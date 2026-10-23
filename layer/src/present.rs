@@ -2,8 +2,10 @@
 //! in one submission chained between the application's semaphores and the real present.
 //!
 //! The submission waits on the application's present semaphores and signals each
-//! composite's own semaphore, which the present then waits on instead. Nothing waits on
-//! the CPU except a capture, which must read its copy back before the present returns.
+//! composite's own semaphore, which the present then waits on instead. The CPU waits only
+//! for a capture, which must read its copy back before the present returns, and before
+//! rewriting an image's readout cells, on that image's previous composite (finished long
+//! before in practice, since the image was presented and re-acquired since).
 
 use std::{
     sync::{
@@ -19,8 +21,10 @@ use s3d_shared::settings::Snapshot;
 use crate::{
     capture::{self, CaptureError, Pending, Target},
     compositor::Composite,
+    controls,
     dispatch::DeviceData,
     hooks::FRAME_LOG_INTERVAL,
+    readout,
     swapchain::Swapchain,
 };
 
@@ -28,17 +32,49 @@ use crate::{
 /// work finished, so waiting on it before reuse does not block in practice.
 const RING_SIZE: usize = 8;
 
+/// One submission made through a [`FenceRing`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ticket {
+    slot: usize,
+    /// Which use of the slot; a later submission through the slot has a higher one.
+    serial: u64,
+    /// Signalled when the submission finishes.
+    pub fence: vk::Fence,
+}
+
 /// Fences of the layer's present-time submissions, reused round-robin.
 #[derive(Debug, Default)]
 pub struct FenceRing {
     fences: Vec<vk::Fence>,
-    /// Per fence: a submission was made with it and has not been waited on.
+    /// Per fence: a submission was made with it and the fence has not been reset since.
     pending: Vec<bool>,
+    /// Per fence: the serial of the submission it last guarded.
+    serials: Vec<u64>,
+    submissions: u64,
     next: usize,
 }
 
 impl FenceRing {
-    /// Submits `submit` on `queue` with the next fence of the ring and returns that fence.
+    /// Returns once the submission of `ticket` has finished. A slot reused since has
+    /// already been waited on, so only the newest use of a slot can block.
+    ///
+    /// # Errors
+    ///
+    /// A failed wait (device lost).
+    ///
+    /// # Safety
+    ///
+    /// `device` must be the ring's device.
+    pub unsafe fn wait_for(&self, device: &ash::Device, ticket: Ticket) -> Result<(), vk::Result> {
+        let slot = ticket.slot;
+        if self.serials.get(slot) != Some(&ticket.serial) || !self.pending[slot] {
+            return Ok(());
+        }
+        // SAFETY: forwarded from the caller; the fence is ours and was submitted.
+        unsafe { device.wait_for_fences(&[ticket.fence], true, u64::MAX) }
+    }
+
+    /// Submits `submit` on `queue` with the next fence of the ring.
     ///
     /// # Errors
     ///
@@ -53,13 +89,14 @@ impl FenceRing {
         device: &ash::Device,
         queue: vk::Queue,
         submit: &vk::SubmitInfo<'_>,
-    ) -> Result<vk::Fence, vk::Result> {
+    ) -> Result<Ticket, vk::Result> {
         // SAFETY: forwarded from the caller; every fence is ours.
         unsafe {
             while self.fences.len() < RING_SIZE {
                 let fence = device.create_fence(&vk::FenceCreateInfo::default(), None)?;
                 self.fences.push(fence);
                 self.pending.push(false);
+                self.serials.push(0);
             }
             let slot = self.next;
             let fence = self.fences[slot];
@@ -69,9 +106,15 @@ impl FenceRing {
                 self.pending[slot] = false;
             }
             device.queue_submit(queue, &[*submit], fence)?;
+            self.submissions += 1;
             self.pending[slot] = true;
+            self.serials[slot] = self.submissions;
             self.next = (slot + 1) % RING_SIZE;
-            Ok(fence)
+            Ok(Ticket {
+                slot,
+                serial: self.submissions,
+                fence,
+            })
         }
     }
 
@@ -111,6 +154,7 @@ impl FenceRing {
             }
         }
         self.pending.clear();
+        self.serials.clear();
         self.next = 0;
     }
 }
@@ -194,6 +238,7 @@ pub unsafe fn prepare(
         )
     };
     let device = &data.next;
+    let readout = controls::readout();
 
     let mut composites = Vec::with_capacity(count);
     let mut gpu = Vec::with_capacity(count);
@@ -205,11 +250,20 @@ pub unsafe fn prepare(
             continue;
         };
         let index = index as usize;
+        let cells = readout
+            .as_deref()
+            .map_or_else(Vec::new, |lines| readout::layout(lines, swapchain.extent));
         // SAFETY: the application presents an index of this swapchain, on this device.
         unsafe {
             if let Some(nanoseconds) = compositor.gpu_nanoseconds(device, context, family, index) {
                 gpu.push(nanoseconds);
             }
+            compositor.show(index, &cells, |ticket| {
+                let ring = state.ring.lock().unwrap_or_else(PoisonError::into_inner);
+                if let Err(error) = ring.wait_for(device, ticket) {
+                    tracing::warn!(%error, "waiting for an earlier composite failed");
+                }
+            });
             match compositor.composite(device, context, state.set_loader_data, family, index) {
                 Ok(composite) => composites.push((swapchain.clone(), index, composite)),
                 Err(error) => tracing::warn!(%error, "cannot record the composite"),
@@ -242,18 +296,16 @@ pub unsafe fn prepare(
     }
 
     // SAFETY: forwarded from the caller.
-    let fence = unsafe { submit(data, queue, info, &composites, capture.as_ref()) }?;
+    let ticket = unsafe { submit(data, queue, info, &composites, capture.as_ref()) }?;
     for (swapchain, index, composite) in &composites {
-        if composite.timed
-            && let Some(compositor) = &swapchain.compositor
-        {
-            compositor.submitted_timed(*index);
+        if let Some(compositor) = &swapchain.compositor {
+            compositor.submitted(*index, ticket, composite.timed);
         }
     }
     let cpu = match (capture, snapshot) {
         (Some(pending), Some(snapshot)) => {
             // SAFETY: the fence covers the submission holding the copy.
-            unsafe { finish_capture(data, fence, pending, &snapshot, frame) };
+            unsafe { finish_capture(data, ticket.fence, pending, &snapshot, frame) };
             None
         }
         _ => Some(started.elapsed()),
@@ -279,7 +331,7 @@ pub unsafe fn prepare(
 }
 
 /// Submits the composites and the capture copy, waiting on the application's present
-/// semaphores. Returns the submission's fence, or `None` (logged) when it failed.
+/// semaphores. Returns the submission's ticket, or `None` (logged) when it failed.
 ///
 /// # Safety
 ///
@@ -290,7 +342,7 @@ unsafe fn submit(
     info: &vk::PresentInfoKHR<'_>,
     composites: &[(Arc<Swapchain>, usize, Composite)],
     capture: Option<&Pending<'_>>,
-) -> Option<vk::Fence> {
+) -> Option<Ticket> {
     let waits = if info.p_wait_semaphores.is_null() {
         &[][..]
     } else {
@@ -321,7 +373,7 @@ unsafe fn submit(
         .unwrap_or_else(PoisonError::into_inner);
     // SAFETY: forwarded from the caller.
     match unsafe { ring.submit(&data.next, queue, &submit) } {
-        Ok(fence) => Some(fence),
+        Ok(ticket) => Some(ticket),
         Err(error) => {
             tracing::warn!(%error, "present-time submission failed, presenting directly");
             None

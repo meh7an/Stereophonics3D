@@ -8,6 +8,7 @@ recorded here in the same change that adds it.
 
 | Source | Licence | What was taken | Where it lives |
 |---|---|---|---|
+| [font8x8](https://github.com/dhepper/font8x8) `font8x8_basic.h` by Daniel Hepper, from Marcel Sondaar's IBM VGA-based font | Public domain | 8x8 bitmaps of U+0020 to U+007E (readout font) | `layer/src/readout.rs` (`FONT`) |
 
 ## Statically Linked Libraries
 

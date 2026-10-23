@@ -9,7 +9,10 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{AnaglyphSettings, Eye, MatrixChoice, ShaderHash, StereoParams};
+use crate::{
+    AnaglyphSettings, Eye, MatrixChoice, ShaderHash, StereoParams,
+    hotkeys::{HotkeySettings, ReadoutSettings},
+};
 
 /// Global settings.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -19,6 +22,10 @@ pub struct Config {
     pub anaglyph: AnaglyphSettings,
     pub dump: DumpSettings,
     pub capture: CaptureSettings,
+    /// Global only: profiles cannot rebind keys.
+    pub hotkeys: HotkeySettings,
+    /// Global only.
+    pub readout: ReadoutSettings,
 }
 
 /// Frames the layer captures from the swapchain, as `<exe>-f<frame>-<eye>.png` plus a
@@ -128,6 +135,8 @@ impl Config {
         check_matrix(&mut issues, anaglyph.matrix);
         check_brightness(&mut issues, anaglyph.brightness);
         check_gamma(&mut issues, anaglyph.gamma);
+        issues.extend(self.hotkeys.validate());
+        issues.extend(self.readout.validate());
         issues
     }
 
@@ -154,6 +163,8 @@ impl Config {
             capture: CaptureSettings {
                 frame: profile.capture.frame.or(self.capture.frame),
             },
+            hotkeys: self.hotkeys,
+            readout: self.readout,
         }
     }
 }

@@ -6,7 +6,7 @@
 //! command buffers tracked, interception-defeating extensions hidden, shaders optionally
 //! dumped, and draws of profile-skipped shaders dropped. Their swapchains are virtualised:
 //! the application renders into layer-owned images that a compositor draws into the real
-//! swapchain at present.
+//! swapchain at present, with an on-screen readout of the stereo values hotkeys adjust.
 
 #[macro_use]
 mod macros;
@@ -16,13 +16,16 @@ mod capture;
 mod chain;
 mod commands;
 mod compositor;
+mod controls;
 mod dispatch;
 mod dump;
 mod extensions;
 mod hooks;
 mod loader;
+mod overlay;
 mod pipelines;
 mod present;
+mod readout;
 mod stereo;
 mod swapchain;
 

@@ -94,6 +94,15 @@ pub enum Error {
         expected: usize,
     },
 
+    /// A profile could not be edited in place.
+    #[error("cannot edit profile {path}: {message}")]
+    ProfileEdit {
+        /// File that failed.
+        path: PathBuf,
+        /// What was wrong with its contents.
+        message: String,
+    },
+
     /// Text is not 16 hex digits.
     #[error("invalid shader hash {text:?}; expected 16 hex digits")]
     InvalidShaderHash {
